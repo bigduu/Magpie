@@ -1,0 +1,20 @@
+# Magpie plugin bundle — ed25519 signing public key
+#
+# Algorithm: ed25519. The value below is the raw 32-byte public key,
+# lowercase hex (64 chars).
+#
+# The matching PRIVATE key is held only as the GitHub Actions repo secret
+# `MAGPIE_PLUGIN_SIGNING_KEY` (an openssl ed25519 PEM), used by the
+# `release` job in .github/workflows/release.yml to sign
+# magpie-plugin-v<version>.tar.gz — the signature is published as the
+# magpie-plugin-v<version>.tar.gz.sig sidecar on each GitHub Release (raw
+# 64-byte ed25519 signature over the exact bundle bytes, hex-encoded).
+#
+# This file is committed for transparency/reference only — it is NOT the
+# trust root bamboo actually uses. bamboo ships this same key baked into
+# its default trusted-publishers store (`plugin_trust.trusted_keys`), so
+# installing an official signed Magpie release needs no extra flags.
+# Publishing it here just lets anyone cross-check "the key bamboo trusts
+# for magpie" against what this repo's own release pipeline signs with.
+
+47e971c39cd93adb18cff50e097cb387df49e9c4d33b0ed62f693eabbe7fc66e

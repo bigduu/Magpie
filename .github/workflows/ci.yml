@@ -13,7 +13,10 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # windows-latest is in the matrix so a Windows regression surfaces on
+        # every PR, not first at release-tag time (release.yml ships a real
+        # x86_64-pc-windows-msvc zip).
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +51,7 @@ jobs:
       # rustls/aws-lc (aws-lc-sys needs a C/asm toolchain that breaks Docker
       # / cross builds). Fails the job if aws-lc-sys sneaks into the tree.
       - name: Verify no aws-lc-sys in the dependency tree
+        shell: bash # bash syntax below; windows-latest defaults to pwsh
         run: |
           if cargo tree -i aws-lc-sys > /dev/null 2>&1; then
             echo "::error::aws-lc-sys is present in the dependency tree — reqwest/tokio-tungstenite must stay on native-tls"
