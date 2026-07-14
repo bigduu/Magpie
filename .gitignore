@@ -1,0 +1,15 @@
+/target
+target/
+
+# Runtime config — carries the bamboo device token + platform bot secrets.
+magpie.json
+
+# Persisted SessionKey -> bamboo session-id maps (phase 2 bridge).
+*_sessions.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

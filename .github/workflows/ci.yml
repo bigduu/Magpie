@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --verbose --all-targets
+
+      - name: Test
+        run: cargo test --verbose
+
+      # Dependency policy: reqwest MUST stay on native-tls, never
+      # rustls/aws-lc (aws-lc-sys needs a C/asm toolchain that breaks Docker
+      # / cross builds). Fails the job if aws-lc-sys sneaks into the tree.
+      - name: Verify no aws-lc-sys in the dependency tree
+        run: |
+          if cargo tree -i aws-lc-sys > /dev/null 2>&1; then
+            echo "::error::aws-lc-sys is present in the dependency tree — reqwest/tokio-tungstenite must stay on native-tls"
+            cargo tree -i aws-lc-sys
+            exit 1
+          fi
+          echo "aws-lc-sys absent, as expected."

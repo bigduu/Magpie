@@ -1,0 +1,56 @@
+[package]
+name = "magpie"
+version = "0.0.0"
+edition = "2021"
+description = "Magpie (鹊) — standalone IM connector for Bamboo. Drives Bamboo agent sessions from Telegram/Feishu over Bamboo's public HTTP/WS API."
+license = "MIT"
+repository = "https://github.com/bigduu/magpie"
+
+[lib]
+name = "magpie"
+path = "src/lib.rs"
+
+[[bin]]
+name = "magpie"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client. NEVER switch to rustls/aws-lc — native-tls only (see
+# reqwest native-tls pin precedent in bamboo/nova). Verify with
+# `cargo tree -i aws-lc-sys` (must error "did not match").
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+
+# WebSocket client for /v2/stream, native-tls to match reqwest's TLS stack.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "native-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# WS URL parsing / futures utilities
+futures-util = "0.3"
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+# Config-file permission check (0600 enforcement) on unix.
+libc = "0.2"
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
