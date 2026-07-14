@@ -1,6 +1,6 @@
 [package]
 name = "magpie"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 description = "Magpie (鹊) — standalone IM connector for Bamboo. Drives Bamboo agent sessions from Telegram/Feishu over Bamboo's public HTTP/WS API."
 license = "MIT"
