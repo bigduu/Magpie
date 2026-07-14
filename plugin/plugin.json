@@ -1,0 +1,47 @@
+{
+  "id": "magpie",
+  "name": "Magpie",
+  "version": "0.0.0",
+  "description": "Standalone IM connector for Bamboo (鹊桥) — drives agent sessions from Telegram/Feishu over Bamboo's public HTTP/WS API.",
+  "provides": {
+    "services": [
+      {
+        "id": "magpie",
+        "name": "Magpie IM connector",
+        "enabled": true,
+        "command": "${platform_bin}",
+        "args": [],
+        "env": {},
+        "health_check": {
+          "kind": "process_alive",
+          "interval_ms": 15000,
+          "timeout_ms": 5000
+        },
+        "restart_policy": {
+          "enabled": true,
+          "initial_backoff_ms": 1000,
+          "max_backoff_ms": 30000,
+          "max_attempts": 0
+        },
+        "graceful_shutdown": {
+          "signal": "term",
+          "timeout_ms": 10000
+        }
+      }
+    ]
+  },
+  "artifacts": {
+    "macos": {
+      "url": "https://github.com/bigduu/magpie/releases/download/v0.0.0/magpie-macos.tar.gz",
+      "sha256": "TBD-filled-by-release-CI"
+    },
+    "windows": {
+      "url": "https://github.com/bigduu/magpie/releases/download/v0.0.0/magpie-windows.zip",
+      "sha256": "TBD-filled-by-release-CI"
+    },
+    "linux": {
+      "url": "https://github.com/bigduu/magpie/releases/download/v0.0.0/magpie-linux.tar.gz",
+      "sha256": "TBD-filled-by-release-CI"
+    }
+  }
+}

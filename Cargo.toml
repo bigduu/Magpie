@@ -33,6 +33,19 @@ serde_json = "1"
 # Errors
 thiserror = "2"
 
+# Platform trait + adapters (ported from bamboo's connect/ module).
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+# Feishu/Lark event long-connection wire protocol (pbbp2.Frame/Header,
+# hand-written prost::Message impls — no build.rs/protoc pipeline).
+prost = "0.13"
+# Feishu callback-ack payload encoding (card.action.trigger toast body).
+base64 = "0.22"
+# Feishu WS reconnect-delay jitter (bamboo pins the same version; no
+# rand_core/CSPRNG feature needed anywhere, so no aws-lc-sys risk here).
+rand = "0.10"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
