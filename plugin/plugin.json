@@ -32,15 +32,15 @@
   },
   "artifacts": {
     "macos": {
-      "url": "https://github.com/bigduu/magpie/releases/download/v0.0.0/magpie-macos.tar.gz",
+      "url": "https://github.com/bigduu/Magpie/releases/download/v0.0.0/magpie-v0.0.0-universal-apple-darwin.tar.gz",
       "sha256": "TBD-filled-by-release-CI"
     },
     "windows": {
-      "url": "https://github.com/bigduu/magpie/releases/download/v0.0.0/magpie-windows.zip",
+      "url": "https://github.com/bigduu/Magpie/releases/download/v0.0.0/magpie-v0.0.0-x86_64-pc-windows-msvc.zip",
       "sha256": "TBD-filled-by-release-CI"
     },
     "linux": {
-      "url": "https://github.com/bigduu/magpie/releases/download/v0.0.0/magpie-linux.tar.gz",
+      "url": "https://github.com/bigduu/Magpie/releases/download/v0.0.0/magpie-v0.0.0-x86_64-unknown-linux-gnu.tar.gz",
       "sha256": "TBD-filled-by-release-CI"
     }
   }

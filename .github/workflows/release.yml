@@ -1,0 +1,366 @@
+name: Release
+
+# Publish a Magpie release on a version tag — nova-style (see Nova's
+# release.yml, the precedent this follows): per-platform binaries attached to
+# a GitHub Release as archive + .sha256 sidecar, then a bamboo-plugin bundle
+# (`magpie-plugin-v<ver>.tar.gz` = the filled-in plugin.json + README) that
+# `bamboo plugin install <url>` can consume, ed25519-signed with the key whose
+# public half is committed at plugin/signing-key.pub.
+#
+# Platforms (exactly one per OS key bamboo's plugin schema understands):
+#   macos   — universal (arm64 + x86_64), ad-hoc signed, .tar.gz
+#   linux   — x86_64-unknown-linux-gnu, .tar.gz (links the system OpenSSL —
+#             the native-tls pin; see Cargo.toml's reqwest comment)
+#   windows — x86_64-pc-windows-msvc, .zip (unsigned — no Authenticode cert;
+#             SmartScreen "unrecognized publisher" on first run is expected)
+#
+# Unlike nova's workflow (mac job creates the Release, later jobs race-append
+# to it), ALL assets here are attached by the single `release` job in one
+# action-gh-release call — no create-vs-update TOCTOU to order around.
+#
+# Trigger:  git tag v0.1.0 && git push origin v0.1.0
+# Manual:   Actions → Release → Run workflow (provide the tag)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)release, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write # create the GitHub Release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Resolve + guard the version once; every job below reuses it ────────
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: meta
+        run: |
+          REF="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$REF" >> "$GITHUB_OUTPUT"
+          # Guard: the tag must match Cargo.toml so the plugin manifest never
+          # names a version that doesn't exist as a release asset.
+          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::tag $REF (=$VERSION) != Cargo.toml version $CARGO_VERSION — bump Cargo.toml or fix the tag"
+            exit 1
+          fi
+
+  # ── macOS: universal binary ────────────────────────────────────────────
+  build-macos:
+    needs: meta
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (both Apple targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build arm64 + x86_64
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Make universal binary
+        run: |
+          lipo -create -output magpie \
+            target/aarch64-apple-darwin/release/magpie \
+            target/x86_64-apple-darwin/release/magpie
+          # lipo strips the per-slice signatures; an arm64 binary MUST be at
+          # least ad-hoc signed to execute, so RE-sign the fat binary. Stable
+          # identifier so the binary has a consistent designated requirement.
+          codesign --force --identifier com.zenith.magpie --sign - magpie
+          lipo -info magpie
+          codesign -dv magpie 2>&1 | head -3
+
+      - name: Smoke test
+        run: |
+          chmod +x magpie
+          ./magpie --version
+          ./magpie --help >/dev/null
+
+      - name: Package tarball + checksum
+        run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+          ASSET="magpie-v${VERSION}-universal-apple-darwin.tar.gz"
+          tar -czf "$ASSET" magpie
+          shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          cat "$ASSET.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            magpie-v${{ needs.meta.outputs.version }}-universal-apple-darwin.tar.gz
+            magpie-v${{ needs.meta.outputs.version }}-universal-apple-darwin.tar.gz.sha256
+          if-no-files-found: error
+
+  # ── Linux: x86_64-unknown-linux-gnu ───────────────────────────────────
+  build-linux:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (release)
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Smoke test
+        run: |
+          BIN=target/x86_64-unknown-linux-gnu/release/magpie
+          "$BIN" --version
+          "$BIN" --help >/dev/null
+
+      - name: Package tarball + checksum
+        run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+          ASSET="magpie-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          cp target/x86_64-unknown-linux-gnu/release/magpie magpie
+          tar -czf "$ASSET" magpie
+          sha256sum "$ASSET" > "$ASSET.sha256"
+          cat "$ASSET.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            magpie-v${{ needs.meta.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            magpie-v${{ needs.meta.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz.sha256
+          if-no-files-found: error
+
+  # ── Windows: x86_64-pc-windows-msvc ────────────────────────────────────
+  build-windows:
+    needs: meta
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (release)
+        shell: pwsh
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Smoke test (confirms the exe actually links + runs, not just compiles)
+        shell: pwsh
+        run: |
+          $exe = "target/x86_64-pc-windows-msvc/release/magpie.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "magpie --version exited $LASTEXITCODE" }
+          & $exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "magpie --help exited $LASTEXITCODE" }
+
+      - name: Package zip + sha256
+        shell: pwsh
+        run: |
+          $version = "${{ needs.meta.outputs.version }}"
+          $asset   = "magpie-v$version-x86_64-pc-windows-msvc.zip"
+          Copy-Item "target/x86_64-pc-windows-msvc/release/magpie.exe" -Destination "magpie.exe"
+          Compress-Archive -Path "magpie.exe" -DestinationPath $asset -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower()
+          "$hash  $asset" | Set-Content -Encoding ascii "$asset.sha256"
+          Write-Host "Built $asset — sha256 $hash"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            magpie-v${{ needs.meta.outputs.version }}-x86_64-pc-windows-msvc.zip
+            magpie-v${{ needs.meta.outputs.version }}-x86_64-pc-windows-msvc.zip.sha256
+          if-no-files-found: error
+
+  # ── Assemble: plugin bundle + sign + ONE GitHub Release call ──────────
+  release:
+    runs-on: ubuntu-latest
+    needs: [meta, build-macos, build-linux, build-windows]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download platform build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve checksums + generate plugin.json
+        id: manifest
+        run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+          sha_of() {
+            # `<hex>  <file>` sidecar format (shasum/sha256sum/pwsh all match)
+            awk '{print $1}' "dist/$1.sha256"
+          }
+          MACOS_SHA="$(sha_of "magpie-v${VERSION}-universal-apple-darwin.tar.gz")"
+          LINUX_SHA="$(sha_of "magpie-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz")"
+          WIN_SHA="$(sha_of "magpie-v${VERSION}-x86_64-pc-windows-msvc.zip")"
+
+          mkdir -p dist/magpie-plugin
+          cp plugin/README.md dist/magpie-plugin/README.md
+          bash plugin/generate-manifest.sh "$VERSION" "$MACOS_SHA" "$LINUX_SHA" "$WIN_SHA" dist/magpie-plugin/plugin.json
+
+          # Structural sanity check before publishing (belt-and-suspenders;
+          # generate-manifest.sh already shape-checks its own inputs).
+          jq -e --arg v "$VERSION" \
+            '.version == $v
+             and (.artifacts.macos.sha256 | test("^[0-9a-f]{64}$"))
+             and (.artifacts.linux.sha256 | test("^[0-9a-f]{64}$"))
+             and (.artifacts.windows.sha256 | test("^[0-9a-f]{64}$"))' \
+            dist/magpie-plugin/plugin.json > /dev/null
+
+          cp dist/magpie-plugin/plugin.json "dist/magpie-plugin-v${VERSION}.json"
+          tar -czf "dist/magpie-plugin-v${VERSION}.tar.gz" -C dist/magpie-plugin plugin.json README.md
+          # Bundle checksum sidecar: `bamboo plugin install <url> --sha256 <hex>`
+          # verifies the downloaded bundle against this (secure-by-default —
+          # a URL install without a checksum is refused).
+          ( cd dist && shasum -a 256 "magpie-plugin-v${VERSION}.tar.gz" > "magpie-plugin-v${VERSION}.tar.gz.sha256" )
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # ── Sign the bundle so bamboo's plugin-trust layer can verify Magpie
+      # is an authentic publisher ──────────────────────────────────────────
+      # PINNED scheme — bamboo's verifier expects EXACTLY this, do not change
+      # without updating bamboo too:
+      #   - ed25519, raw 64-byte signature (no ASN.1/DER wrapping).
+      #   - signed message = the exact bytes of the .tar.gz bundle itself
+      #     (NOT its sha256).
+      #   - sidecar `magpie-plugin-v<ver>.tar.gz.sig` = the signature as
+      #     lowercase hex (128 chars).
+      # The private key lives only as the `MAGPIE_PLUGIN_SIGNING_KEY` repo
+      # secret (an openssl ed25519 PEM); its public half is committed at
+      # plugin/signing-key.pub for reference (bamboo's actual trust root is
+      # its own baked-in default, not this file).
+      #
+      # Skip-with-warning, not fail, when the secret is unset: the pipeline
+      # keeps publishing (an UNSIGNED bundle, which bamboo will refuse
+      # without `--allow-unsigned`) instead of hard-breaking every release
+      # before the secret is provisioned.
+      - name: Sign plugin bundle (ed25519)
+        id: sign
+        env:
+          MAGPIE_PLUGIN_SIGNING_KEY: ${{ secrets.MAGPIE_PLUGIN_SIGNING_KEY }}
+        run: |
+          VERSION="${{ steps.manifest.outputs.version }}"
+          BUNDLE="dist/magpie-plugin-v${VERSION}.tar.gz"
+
+          if [ -z "$MAGPIE_PLUGIN_SIGNING_KEY" ]; then
+            echo "::warning::MAGPIE_PLUGIN_SIGNING_KEY secret is not set — publishing an UNSIGNED plugin bundle ($BUNDLE has no .sig). Installing it will require bamboo's --allow-unsigned flag until the secret is provisioned. See plugin/signing-key.pub."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "$MAGPIE_PLUGIN_SIGNING_KEY" > signing_key.pem
+          chmod 600 signing_key.pem
+          trap 'rm -f signing_key.pem' EXIT
+
+          openssl pkeyutl -sign -inkey signing_key.pem -rawin -in "$BUNDLE" -out sig.bin
+          xxd -p -c 256 sig.bin | tr -d '\n' > "${BUNDLE}.sig"
+          rm -f sig.bin
+
+          if ! grep -Eq '^[0-9a-f]{128}$' "${BUNDLE}.sig"; then
+            echo "::error::signature is not 128 lowercase hex chars ($(wc -c < "${BUNDLE}.sig") chars produced) — aborting release rather than publishing a malformed .sig"
+            exit 1
+          fi
+
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          echo "Signed $BUNDLE -> ${BUNDLE}.sig (128 hex chars)"
+
+      # Self-verify before publishing: reconstruct the pinned public key's
+      # PEM from the hex committed at plugin/signing-key.pub and confirm the
+      # signature just produced actually verifies against it. Catches a
+      # wrong/corrupt MAGPIE_PLUGIN_SIGNING_KEY (e.g. mismatched keypair)
+      # before it ships an unverifiable .sig to users.
+      - name: Self-verify plugin bundle signature
+        if: steps.sign.outputs.signed == 'true'
+        run: |
+          VERSION="${{ steps.manifest.outputs.version }}"
+          BUNDLE="dist/magpie-plugin-v${VERSION}.tar.gz"
+          PUBHEX="$(grep -Eo '^[0-9a-f]{64}$' plugin/signing-key.pub | head -1)"
+
+          # ed25519 SubjectPublicKeyInfo DER = fixed 12-byte ASN.1 prefix +
+          # the raw 32-byte public key — lets openssl load a bare hex pubkey.
+          printf '302a300506032b6570032100%s' "$PUBHEX" | xxd -r -p > pub.der
+          openssl pkey -pubin -inform DER -in pub.der -pubout -out pub.pem
+          xxd -r -p "${BUNDLE}.sig" > sig.bin
+
+          if ! openssl pkeyutl -verify -pubin -inkey pub.pem -rawin -in "$BUNDLE" -sigfile sig.bin; then
+            echo "::error::self-verify FAILED — the signature just produced does not verify against plugin/signing-key.pub. MAGPIE_PLUGIN_SIGNING_KEY may not match the pinned public key. Aborting before publishing a broken signature."
+            rm -f pub.der pub.pem sig.bin
+            exit 1
+          fi
+          rm -f pub.der pub.pem sig.bin
+          echo "Self-verify OK: bundle signature matches plugin/signing-key.pub"
+
+      - name: Create GitHub Release with all assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: Magpie ${{ needs.meta.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/magpie-v${{ needs.meta.outputs.version }}-*.tar.gz
+            dist/magpie-v${{ needs.meta.outputs.version }}-*.tar.gz.sha256
+            dist/magpie-v${{ needs.meta.outputs.version }}-*.zip
+            dist/magpie-v${{ needs.meta.outputs.version }}-*.zip.sha256
+            dist/magpie-plugin-v${{ steps.manifest.outputs.version }}.tar.gz
+            dist/magpie-plugin-v${{ steps.manifest.outputs.version }}.tar.gz.sha256
+            dist/magpie-plugin-v${{ steps.manifest.outputs.version }}.json
+
+      # Attached in its own step because the .sig only exists when signing
+      # actually ran — see the skip-if-unset decision on "Sign plugin bundle"
+      # above. This second call only appends to the release created above.
+      - name: Attach plugin signature to GitHub Release
+        if: steps.sign.outputs.signed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/magpie-plugin-v${{ steps.manifest.outputs.version }}.tar.gz.sig

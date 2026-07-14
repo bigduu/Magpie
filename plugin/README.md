@@ -21,8 +21,9 @@ device token, plus the `platforms[]` list).
 Every entry under `artifacts.<platform>.sha256` in `plugin.json` is the
 literal string `"TBD-filled-by-release-CI"` — **not** a real hash. This
 mirrors the "Zenith version placeholder strategy": the manifest ships with
-`0.0.0`/placeholder values in the repo, and the release pipeline is
-responsible for:
+`0.0.0`/placeholder values in the repo, and the release pipeline
+(`.github/workflows/release.yml`'s `release` job, which runs
+`generate-manifest.sh`) is responsible for:
 
 1. Building the per-platform `magpie` binary for `macos` / `windows` / `linux`.
 2. Packaging each as the single-root-executable archive the manifest's
@@ -49,3 +50,16 @@ Also bump `version` (both the top-level `plugin.json` field and the
 `v0.0.0` release-tag segment baked into each `artifacts.*.url`) as part of
 the same release step — the two must stay in lockstep or the installer will
 fetch the wrong build.
+
+## Signing
+
+The release job packages the filled-in `plugin.json` + this README as
+`magpie-plugin-v<version>.tar.gz` and ed25519-signs it (raw 64-byte
+signature over the exact bundle bytes, published hex-encoded as the
+`.tar.gz.sig` sidecar) with the key whose public half is committed at
+`signing-key.pub`. The private key exists only as the
+`MAGPIE_PLUGIN_SIGNING_KEY` GitHub Actions repo secret. bamboo verifies the
+signature against its `plugin_trust.trusted_keys` store (magpie's key ships
+in bamboo's defaults, next to nova's), so an official signed release
+installs with no `--allow-unsigned` flag; if the secret is missing at
+release time the bundle is published unsigned with a workflow warning.
