@@ -67,3 +67,6 @@ libc = "0.2"
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
+# `tokio::time::{pause, advance}` — used to assert await_valid_config's poll
+# loop sleeps instead of busy-spinning (issue #4), without a real 30s wait.
+tokio = { version = "1", features = ["test-util"] }
