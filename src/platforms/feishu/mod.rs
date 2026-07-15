@@ -306,18 +306,21 @@ fn escape_feishu_markdown(text: &str) -> String {
 
 /// Builds a schema-2.0 interactive card: `config.update_multi:true`, a
 /// markdown body element (fixed `element_id:"main_text"`, escaped text), and
-/// — when present — one `"action"` element per button row, per
-/// `docs/feishu-adapter-plan.md` §2c outbound decision 2. The exact button
-/// element wrapper (`tag:"action"` with a nested `"actions"` array) is this
-/// adapter's own choice: the plan pins ONLY the `behaviors`/`value.cb`
-/// shape, not the surrounding container, so this is the one place protocol
-/// shape was inferred rather than verified — flagged in the task report.
+/// — when present — one `column_set` element per button row (one column per
+/// button), per `docs/feishu-adapter-plan.md` §2c outbound decision 2. The
+/// plan pins ONLY the `behaviors`/`value.cb` shape, not the surrounding
+/// container — the container is this adapter's choice, verified live.
 ///
-/// Schema 2.0 nests `elements` under `body` — a TOP-LEVEL `elements` key is
-/// the v1 location and the real API rejects it with
-/// `200621 parse card json err: unknown property "elements" at path []`
-/// (caught live in the 2026-07-15 real-device e2e; the wiremock tests can't
-/// see this because they don't validate Feishu's card schema).
+/// Both container choices here were dictated by the REAL API in the
+/// 2026-07-15 real-device e2e (the wiremock tests can't see this because
+/// they don't validate Feishu's card schema):
+/// - `elements` must nest under `body` — the v1 top-level location is
+///   rejected with `200621 parse card json err: unknown property
+///   "elements" at path []`.
+/// - the v1 `tag:"action"` row container is GONE in schema 2.0 — rejected
+///   with `200861 cards of schema V2 no longer support this capability:
+///   unsupported tag action`. Button rows are laid out with `column_set`
+///   (a "weighted" column per button) instead.
 fn build_card(text: &str, buttons: Option<&[Vec<Button>]>) -> serde_json::Value {
     let mut elements = vec![serde_json::json!({
         "tag": "markdown",
@@ -327,20 +330,26 @@ fn build_card(text: &str, buttons: Option<&[Vec<Button>]>) -> serde_json::Value 
 
     if let Some(rows) = buttons {
         for row in rows {
-            let actions: Vec<serde_json::Value> = row
+            let columns: Vec<serde_json::Value> = row
                 .iter()
                 .map(|button| {
                     serde_json::json!({
-                        "tag": "button",
-                        "text": { "tag": "plain_text", "content": button.label },
-                        "type": "default",
-                        "behaviors": [
-                            { "type": "callback", "value": { "cb": button.callback_data } }
-                        ],
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "elements": [{
+                            "tag": "button",
+                            "text": { "tag": "plain_text", "content": button.label },
+                            "type": "default",
+                            "width": "fill",
+                            "behaviors": [
+                                { "type": "callback", "value": { "cb": button.callback_data } }
+                            ],
+                        }],
                     })
                 })
                 .collect();
-            elements.push(serde_json::json!({ "tag": "action", "actions": actions }));
+            elements.push(serde_json::json!({ "tag": "column_set", "columns": columns }));
         }
     }
 
@@ -801,10 +810,12 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&send_request.body).unwrap();
         let content: serde_json::Value =
             serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
-        let action = &content["body"]["elements"][1];
-        assert_eq!(action["tag"], serde_json::json!("action"));
+        let row = &content["body"]["elements"][1];
+        assert_eq!(row["tag"], serde_json::json!("column_set"));
+        let button = &row["columns"][0]["elements"][0];
+        assert_eq!(button["tag"], serde_json::json!("button"));
         assert_eq!(
-            action["actions"][0]["behaviors"][0]["value"]["cb"],
+            button["behaviors"][0]["value"]["cb"],
             serde_json::json!("n1:0")
         );
     }
