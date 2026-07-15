@@ -356,11 +356,18 @@ impl StreamingRenderer {
     fn resume(platform: Arc<dyn Platform>, reply_ctx: ReplyCtx, state: StreamState) -> Self {
         let StreamState {
             tool_lines,
-            assistant_text,
+            mut assistant_text,
             status_ref,
             last_edit_at,
             chars_since_edit,
         } = state;
+        // Paragraph break between the pre-pause text and whatever the
+        // resumed run streams next — without it the resumed reply glues
+        // straight onto the question ("Pick one:OASIS", issue #6). Trailing
+        // whitespace is trimmed at finalize if no tokens follow.
+        if !assistant_text.is_empty() && !assistant_text.ends_with('\n') {
+            assistant_text.push_str("\n\n");
+        }
         Self {
             platform,
             reply_ctx,
@@ -484,7 +491,7 @@ impl StreamingRenderer {
     /// edit plus the full result sent as fresh chunked messages (bamboo issue
     /// #458 §B point 5).
     async fn finalize_success(&mut self) {
-        let full = self.full_body();
+        let full = self.full_body().trim_end().to_string();
         if full.trim().is_empty() {
             self.apply_edit("✅ Done.".to_string()).await;
             return;
@@ -1039,6 +1046,13 @@ mod tests {
         assert!(last.starts_with('✅'), "final edit not a success: {last}");
         assert!(last.contains("Before the question."));
         assert!(last.contains("After the answer."));
+        // The resumed segment starts on its own paragraph — without the
+        // separator the resumed reply glues straight onto the pre-pause text
+        // ("Pick one:OASIS", issue #6).
+        assert!(
+            last.contains("Before the question. \n\nAfter the answer."),
+            "resumed text must be separated from pre-pause text: {last}"
+        );
     }
 
     #[tokio::test]

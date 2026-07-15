@@ -895,12 +895,20 @@ impl ConnectBridge {
                     let caps = platform.capabilities();
                     let parked =
                         ParkedAsk::new(approvals::new_nonce(), session_id.to_string(), &ask);
+                    let ask_text = approvals::format_ask_text(&parked);
 
-                    if let Err(error) =
-                        approvals::render_ask(&platform, &reply_ctx, &parked, caps.buttons).await
-                    {
-                        tracing::warn!("magpie bridge: failed to render pending ask: {error}");
-                    }
+                    let ask_ref =
+                        match approvals::render_ask(&platform, &reply_ctx, &parked, caps.buttons)
+                            .await
+                        {
+                            Ok(msg_ref) => Some(msg_ref),
+                            Err(error) => {
+                                tracing::warn!(
+                                    "magpie bridge: failed to render pending ask: {error}"
+                                );
+                                None
+                            }
+                        };
 
                     let (ask_tx, mut ask_rx) = mpsc::channel(1);
                     {
@@ -912,13 +920,51 @@ impl ConnectBridge {
 
                     match ask_rx.recv().await {
                         Some(AskResolution::Answer(answer)) => {
+                            // Subscribe BEFORE respond — the same
+                            // subscribe-before-execute invariant the initial
+                            // run relies on (ARCHITECTURE.md). A server-side
+                            // resubscribe REPLACES the channel's forwarder
+                            // with a fresh broadcast cut, so subscribing
+                            // after `respond` leaves a window where the
+                            // resumed run's events — or, if the WS is mid-
+                            // reconnect while the Subscribe command waits,
+                            // the entire run through `Complete` — are
+                            // emitted into no subscription at all; the
+                            // render task then waits forever on an idle
+                            // channel and the final reply never renders
+                            // (issue #6). A failed subscribe still records
+                            // the answer below (the old degradation path):
+                            // dropping the user's decision is strictly worse
+                            // than rendering nothing.
+                            let new_rx = self.api.subscribe_session(session_id).await;
                             let respond_request = RespondRequest {
-                                response: answer,
+                                response: answer.clone(),
                                 ..Default::default()
                             };
                             match self.api.respond(session_id, respond_request).await {
                                 Ok(_response) => {
-                                    match self.api.subscribe_session(session_id).await {
+                                    // Mark the ask message answered — ✅ +
+                                    // the chosen answer, buttons dropped (an
+                                    // edit replaces the whole message body) —
+                                    // so stale buttons can't be pressed again
+                                    // and the chat shows WHAT was chosen.
+                                    // Best-effort: an edit failure never
+                                    // fails the resume.
+                                    if caps.edit_message {
+                                        if let Some(msg_ref) = &ask_ref {
+                                            let done = format!("{ask_text}\n\n✅ {answer}");
+                                            if let Err(error) = platform
+                                                .edit(msg_ref, OutboundMessage::text(done))
+                                                .await
+                                            {
+                                                tracing::debug!(
+                                                    "magpie bridge: answered-ask edit failed \
+                                                     (non-fatal): {error}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    match new_rx {
                                         Ok(new_rx) => {
                                             rx = new_rx;
                                             continue;
@@ -1090,6 +1136,11 @@ mod tests {
         respond_calls: TokioMutex<Vec<(String, String)>>,
         respond_pending_calls: TokioMutex<Vec<String>>,
         subscribe_calls: TokioMutex<Vec<String>>,
+        /// Interleaved `"subscribe"`/`"respond"` markers in true call order —
+        /// the per-method vecs above can't express cross-method ordering,
+        /// which the resume path's subscribe-BEFORE-respond invariant
+        /// (issue #6) needs asserted.
+        ops: TokioMutex<Vec<&'static str>>,
         channels: TokioMutex<HashMap<String, mpsc::Sender<StreamEvent>>>,
         next_id: AtomicUsize,
         chat_error: Option<String>,
@@ -1105,6 +1156,7 @@ mod tests {
                 respond_calls: TokioMutex::new(Vec::new()),
                 respond_pending_calls: TokioMutex::new(Vec::new()),
                 subscribe_calls: TokioMutex::new(Vec::new()),
+                ops: TokioMutex::new(Vec::new()),
                 channels: TokioMutex::new(HashMap::new()),
                 next_id: AtomicUsize::new(1),
                 chat_error: None,
@@ -1120,6 +1172,7 @@ mod tests {
                 respond_calls: TokioMutex::new(Vec::new()),
                 respond_pending_calls: TokioMutex::new(Vec::new()),
                 subscribe_calls: TokioMutex::new(Vec::new()),
+                ops: TokioMutex::new(Vec::new()),
                 channels: TokioMutex::new(HashMap::new()),
                 next_id: AtomicUsize::new(1),
                 chat_error: None,
@@ -1196,6 +1249,7 @@ mod tests {
                 .lock()
                 .await
                 .push((session_id.to_string(), request.response.clone()));
+            self.ops.lock().await.push("respond");
             if let Some(message) = &self.respond_error {
                 return Err(ClientError::Api {
                     method: "POST",
@@ -1240,6 +1294,7 @@ mod tests {
                 .lock()
                 .await
                 .push(session_id.to_string());
+            self.ops.lock().await.push("subscribe");
             let (tx, rx) = mpsc::channel(16);
             self.channels
                 .lock()
@@ -1621,7 +1676,7 @@ mod tests {
     fn buttons_and_edit_capabilities() -> crate::platform::Capabilities {
         crate::platform::Capabilities {
             buttons: true,
-            edit_message: false,
+            edit_message: true,
             images: false,
             files: false,
         }
@@ -1706,13 +1761,38 @@ mod tests {
         );
         assert_eq!(platform.answered_callbacks.lock().await.len(), 1);
 
-        // Bridge re-subscribed after respond (per ARCHITECTURE.md) — end the
-        // resumed run so the background task settles.
+        // The resume leg re-subscribes BEFORE responding (issue #6): a
+        // server-side resubscribe replaces the channel's forwarder with a
+        // fresh broadcast cut, so subscribing after `respond` can lose the
+        // resumed run's events entirely — only the ordered op log can see
+        // the cross-method ordering.
         wait_until(|| {
             let api = api.clone();
             async move { api.subscribe_calls.lock().await.len() == 2 }
         })
         .await;
+        assert_eq!(
+            api.ops.lock().await.as_slice(),
+            ["subscribe", "subscribe", "respond"],
+            "resume must subscribe before respond"
+        );
+
+        // The answered ask message was edited to ✅ + the chosen answer, so
+        // its now-stale buttons can't be pressed again (issue #6 follow-up).
+        wait_until(|| {
+            let platform = platform.clone();
+            async move {
+                platform
+                    .edits
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|edit| edit.contains("✅ Approve"))
+            }
+        })
+        .await;
+
+        // End the resumed run so the background task settles.
         let session_id = bridge.session_id_for_key(&key).await.unwrap();
         api.sender_for(&session_id)
             .await
