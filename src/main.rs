@@ -11,17 +11,31 @@
 //! layout table.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use magpie::bamboo::{BambooClient, BambooStream};
 use magpie::bridge::{BambooApi, BambooEndpoint, ConnectBridge};
 use magpie::config::{self, resolve_feishu_base_url, MagpieConfig, PlatformConfig};
 use magpie::platform::{Inbound, Platform};
 use magpie::platforms;
+
+/// How often to re-check the config file while idling because it is
+/// missing, unparseable/invalid, or has an empty `platforms: []` (issue #4).
+/// A "modest poll" per the issue — frequent enough that fixing the config
+/// takes effect quickly, far below any rate that would look like the old
+/// 1s supervisor-restart hot loop.
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How rarely to repeat the idle-state log line while nothing has changed,
+/// so an operator who ignores the plugin for a while still sees occasional
+/// evidence it's alive and waiting, without spamming a line every 30s.
+const IDLE_REMINDER_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Magpie — the standalone IM connector for Bamboo.
 #[derive(Debug, Parser)]
@@ -58,13 +72,46 @@ async fn main() -> std::process::ExitCode {
     let config_path = config::resolve_config_path(args.config.as_deref());
     tracing::info!("magpie: loading config from {}", config_path.display());
 
-    let config: MagpieConfig = match config::load_config(&config_path) {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::error!("magpie: failed to load config: {error}");
-            return std::process::ExitCode::FAILURE;
+    // `--check` is an interactive, operator-invoked diagnostic (not the
+    // supervised service loop bamboo's ServiceManager restarts) — it should
+    // fail fast with a clear error rather than idle waiting for a config
+    // that the operator is actively trying to debug.
+    if args.check {
+        let config: MagpieConfig = match config::load_config(&config_path) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!("magpie: failed to load config: {error}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let client = match BambooClient::new(&config.bamboo) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::error!("magpie: failed to construct the bamboo HTTP client: {error}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        return run_check(&client).await;
+    }
+
+    // Issue #4: a missing/unparseable/invalid config file, or a valid one
+    // with `platforms: []`, is a NORMAL state for a freshly installed and
+    // not-yet-configured plugin — not a crash. Under bamboo's ServiceManager
+    // (unlimited restart attempts), exiting here used to respawn every ~1s
+    // forever. Idle-and-poll instead: `await_valid_config` returns as soon
+    // as the config becomes valid AND non-empty (races against the shutdown
+    // signal so SIGTERM/Ctrl-C still works immediately while idling).
+    let config: MagpieConfig = tokio::select! {
+        config = await_valid_config(&config_path, CONFIG_POLL_INTERVAL) => config,
+        _ = shutdown_signal() => {
+            tracing::info!("magpie: shutdown signal received while awaiting configuration");
+            return std::process::ExitCode::SUCCESS;
         }
     };
+    tracing::info!(
+        "magpie: configuration ready — {} platform(s) configured",
+        config.platforms.len()
+    );
 
     let client = match BambooClient::new(&config.bamboo) {
         Ok(client) => client,
@@ -73,15 +120,6 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-
-    if args.check {
-        return run_check(&client).await;
-    }
-
-    if config.platforms.is_empty() {
-        tracing::warn!("magpie: no platforms configured in magpie.json — nothing to do");
-        return std::process::ExitCode::SUCCESS;
-    }
 
     let stream = BambooStream::connect(config.bamboo.clone());
     let api: Arc<dyn BambooApi> = Arc::new(BambooEndpoint::new(client, stream));
@@ -230,6 +268,98 @@ async fn shutdown_signal() {
     }
 }
 
+/// Outcome of a single config-file check: either it's ready to run with
+/// ([`ConfigState::Ready`]), or startup should idle for [`IdleReason`].
+#[derive(Debug)]
+enum ConfigState {
+    Ready(MagpieConfig),
+    Idle(IdleReason),
+}
+
+/// Why startup is idling instead of running — covers both halves of issue
+/// #4 (missing/unparseable/invalid config file, and a valid config with no
+/// platforms configured).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdleReason {
+    /// Covers a missing file, a parse error, AND a failed `validate_config`
+    /// (bad/empty credentials, invalid feishu domain, ...) — all of these
+    /// are equally "not ready yet, try again", not a crash.
+    ConfigNotReady(String),
+    NoPlatformsConfigured,
+}
+
+impl std::fmt::Display for IdleReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IdleReason::ConfigNotReady(message) => write!(f, "config not ready: {message}"),
+            IdleReason::NoPlatformsConfigured => {
+                write!(
+                    f,
+                    "no platforms configured (magpie.json has \"platforms\": [])"
+                )
+            }
+        }
+    }
+}
+
+/// Reads + validates the config file at `path` once and classifies the
+/// result. Pure sync wrapper around [`config::load_config`] so the
+/// missing-file / parse-error / empty-platforms cases can be unit-tested
+/// without touching the async idle loop below.
+fn classify_config(path: &Path) -> ConfigState {
+    match config::load_config(path) {
+        Ok(config) if config.platforms.is_empty() => {
+            ConfigState::Idle(IdleReason::NoPlatformsConfigured)
+        }
+        Ok(config) => ConfigState::Ready(config),
+        Err(error) => ConfigState::Idle(IdleReason::ConfigNotReady(error.to_string())),
+    }
+}
+
+/// Polls `path` at `poll_interval` until it holds a valid, non-empty
+/// config, then returns it. This is issue #4's fix: previously magpie
+/// exited (FAILURE on missing/invalid config, SUCCESS on empty
+/// `platforms`) and relied on bamboo's ServiceManager to restart it —
+/// which it does every ~1s (`max_attempts: 0` = unlimited), producing a
+/// hot loop for a plugin that is simply not configured yet.
+///
+/// Never busy-spins: each iteration does one synchronous file read/parse
+/// then sleeps for the full `poll_interval` (this also doubles as the
+/// "hot-reload" path the issue asks to preserve — editing the config file
+/// while idle is picked up on the next poll, same as an operator editing it
+/// between the old restart-loop's exits). Logs once when idling begins (or
+/// when the failure reason changes) and then at most once every
+/// [`IDLE_REMINDER_INTERVAL`] while it persists, so a long-idle plugin
+/// doesn't spam the log. Callers race this against [`shutdown_signal`] so
+/// SIGTERM/Ctrl-C interrupts a sleeping poll immediately.
+async fn await_valid_config(path: &Path, poll_interval: Duration) -> MagpieConfig {
+    let mut last_reason: Option<IdleReason> = None;
+    let mut last_logged_at: Option<Instant> = None;
+
+    loop {
+        match classify_config(path) {
+            ConfigState::Ready(config) => return config,
+            ConfigState::Idle(reason) => {
+                let reason_changed = last_reason.as_ref() != Some(&reason);
+                let reminder_due = last_logged_at
+                    .map(|at| at.elapsed() >= IDLE_REMINDER_INTERVAL)
+                    .unwrap_or(true);
+                if reason_changed || reminder_due {
+                    tracing::warn!(
+                        "magpie: idling — {reason} (this is normal for a freshly installed, \
+                         not-yet-configured plugin; re-checking {} every {}s)",
+                        path.display(),
+                        poll_interval.as_secs()
+                    );
+                    last_logged_at = Some(Instant::now());
+                }
+                last_reason = Some(reason);
+            }
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 /// Spawns the pair of background tasks every platform entry needs — the
 /// adapter's own `start()` loop and its [`dispatch_loop`] — and logs the
 /// startup. Ported from bamboo's `connect::spawn_platform_tasks`.
@@ -354,6 +484,7 @@ async fn run_check(client: &BambooClient) -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn platform(platform_type: &str, token: Option<&str>) -> PlatformConfig {
         match platform_type {
@@ -425,5 +556,146 @@ mod tests {
     #[test]
     fn multi_bot_guard_handles_an_empty_platform_list() {
         assert_eq!(multi_bot_guard(&[]), Vec::<bool>::new());
+    }
+
+    // ---- issue #4: idle-and-wait instead of exit when unconfigured ----
+
+    fn valid_bamboo_only_json() -> String {
+        serde_json::json!({
+            "bamboo": {
+                "base_url": "http://127.0.0.1:9560",
+                "device_id": "bamboo_abc123",
+                "token": "bd1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            }
+        })
+        .to_string()
+    }
+
+    fn valid_config_with_one_platform_json() -> String {
+        serde_json::json!({
+            "bamboo": {
+                "base_url": "http://127.0.0.1:9560",
+                "device_id": "bamboo_abc123",
+                "token": "bd1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            },
+            "platforms": [
+                { "type": "telegram", "token": "123:abc", "allow_from": ["1"] }
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn classify_config_missing_file_is_idle_not_ready() {
+        let path = Path::new("/nonexistent/definitely/not/here/magpie.json");
+        match classify_config(path) {
+            ConfigState::Idle(IdleReason::ConfigNotReady(message)) => {
+                assert!(message.contains("failed to read"), "message: {message}");
+            }
+            other => panic!("expected Idle(ConfigNotReady), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_config_parse_error_is_idle_not_ready() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"not json").unwrap();
+        match classify_config(file.path()) {
+            ConfigState::Idle(IdleReason::ConfigNotReady(_)) => {}
+            other => panic!("expected Idle(ConfigNotReady), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_config_validation_error_is_idle_not_ready() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        // platforms entry fails validate_config (telegram missing token) —
+        // this is still an "idle and retry" case, not a crash.
+        let json = serde_json::json!({
+            "bamboo": {
+                "base_url": "http://127.0.0.1:9560",
+                "device_id": "bamboo_abc123",
+                "token": "bd1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            },
+            "platforms": [{ "type": "telegram", "allow_from": [] }]
+        });
+        file.write_all(json.to_string().as_bytes()).unwrap();
+        match classify_config(file.path()) {
+            ConfigState::Idle(IdleReason::ConfigNotReady(message)) => {
+                assert!(message.contains("telegram"), "message: {message}");
+            }
+            other => panic!("expected Idle(ConfigNotReady), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_config_empty_platforms_is_idle_no_platforms_configured() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(valid_bamboo_only_json().as_bytes()).unwrap();
+        match classify_config(file.path()) {
+            ConfigState::Idle(IdleReason::NoPlatformsConfigured) => {}
+            other => panic!("expected Idle(NoPlatformsConfigured), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_config_ready_when_a_platform_is_configured() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(valid_config_with_one_platform_json().as_bytes())
+            .unwrap();
+        match classify_config(file.path()) {
+            ConfigState::Ready(config) => assert_eq!(config.platforms.len(), 1),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_valid_config_does_not_busy_spin_and_picks_up_a_later_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magpie.json");
+        let poll_interval = Duration::from_secs(30);
+
+        let wait = await_valid_config(&path, poll_interval);
+        tokio::pin!(wait);
+
+        // The first check (config missing) happens immediately without
+        // sleeping first; it must still be pending afterward.
+        assert!(futures_util::poll!(&mut wait).is_pending());
+
+        // Advancing LESS than a full poll interval must not trigger another
+        // check — if it did, writing the config now would be picked up
+        // immediately, which is exactly the busy-spin this test rules out.
+        std::fs::write(&path, valid_config_with_one_platform_json()).unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            futures_util::poll!(&mut wait).is_pending(),
+            "await_valid_config must sleep for the full poll_interval between checks"
+        );
+
+        // Advancing past the poll interval boundary lets the next check
+        // observe the config that's been sitting there since the write
+        // above.
+        tokio::time::advance(poll_interval).await;
+        match futures_util::poll!(&mut wait) {
+            std::task::Poll::Ready(config) => assert_eq!(config.platforms.len(), 1),
+            std::task::Poll::Pending => {
+                panic!("expected await_valid_config to resolve once a valid config appears")
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_valid_config_resolves_immediately_when_already_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magpie.json");
+        std::fs::write(&path, valid_config_with_one_platform_json()).unwrap();
+
+        let config = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_valid_config(&path, Duration::from_secs(30)),
+        )
+        .await
+        .expect("must not need to wait for an already-valid config");
+        assert_eq!(config.platforms.len(), 1);
     }
 }
