@@ -32,7 +32,7 @@
 
 use std::sync::Arc;
 
-use crate::platform::{Button, OutboundMessage, Platform, PlatformResult, ReplyCtx};
+use crate::platform::{Button, MessageRef, OutboundMessage, Platform, PlatformResult, ReplyCtx};
 use crate::render::PendingAsk;
 
 /// Longest a button's visible label is allowed to be — Telegram (and most IM
@@ -116,15 +116,16 @@ pub fn format_ask_text(ask: &ParkedAsk) -> String {
 /// Render `ask` to the chat: inline buttons (one per option, `callback_data =
 /// "{nonce}:{index}"`) when `buttons_capable`, always alongside the numbered
 /// text list — per bamboo issue #458, buttons are an enhancement, never a
-/// requirement. Returns the platform error (if the send failed) so the
-/// caller can log it; rendering failure does not itself invalidate the
-/// parked ask (a text reply can still resolve it).
+/// requirement. Returns the sent message's [`MessageRef`] so the bridge can
+/// edit the ask once answered (✅ + chosen answer, buttons dropped — issue
+/// #6 follow-up); a send failure is returned for logging but does not itself
+/// invalidate the parked ask (a text reply can still resolve it).
 pub async fn render_ask(
     platform: &Arc<dyn Platform>,
     reply_ctx: &ReplyCtx,
     ask: &ParkedAsk,
     buttons_capable: bool,
-) -> PlatformResult<()> {
+) -> PlatformResult<MessageRef> {
     let text = format_ask_text(ask);
     let outbound = if buttons_capable && !ask.options.is_empty() {
         let rows: Vec<Vec<Button>> = ask
@@ -142,7 +143,7 @@ pub async fn render_ask(
     } else {
         OutboundMessage::text(text)
     };
-    platform.reply(reply_ctx, outbound).await.map(|_| ())
+    platform.reply(reply_ctx, outbound).await
 }
 
 // ---------------------------------------------------------------------------
