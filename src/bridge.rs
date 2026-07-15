@@ -46,7 +46,9 @@ use crate::bamboo::types::{
     RespondRequest, RespondSubmitResponse, StopResponse,
 };
 use crate::bamboo::{BambooClient, BambooStream, ClientError, StreamError};
-use crate::platform::{CallbackQuery, InboundMessage, OutboundMessage, Platform, ReplyCtx};
+use crate::platform::{
+    CallbackQuery, InboundMessage, MessageRef, OutboundMessage, Platform, ReplyCtx,
+};
 use crate::render;
 
 /// `platform:chat_id:user_id` — the chat-scoped routing key mapping to a
@@ -243,6 +245,24 @@ enum AskResolution {
     Invalidated,
 }
 
+/// What [`ConnectBridge::try_resolve_pending_ask`] found when an inbound
+/// reply matched a chat's parked ask.
+enum PendingAskMatch {
+    /// The ordinary case: a live [`ConnectBridge::render_until_settled`]
+    /// task is parked waiting on `ask_resolution` for exactly this ask —
+    /// hand it the answer and it owns the rest of the resume.
+    Live(mpsc::Sender<AskResolution>, String),
+    /// The ask survived a magpie restart (`resync_pending_asks`) with no
+    /// live render task to hand off to — `ask_resolution` was never set,
+    /// because there is no waiting `render_until_settled` after a restart
+    /// (bamboo issue #9). The caller must resolve it inline (see
+    /// [`ConnectBridge::resolve_resynced_ask`]) instead of treating this as
+    /// a non-match and falling through to the normal busy/queue routing,
+    /// which would silently drop the answer and start an unrelated new run
+    /// on a session that is still suspended server-side.
+    Resynced(ParkedAsk, String),
+}
+
 /// Strips a Telegram-style `@BotName` command suffix (`/stop@MyBot` ->
 /// `/stop`) so mention-qualified commands still match in group chats.
 fn strip_command_suffix(text: &str) -> &str {
@@ -355,24 +375,36 @@ impl ConnectBridge {
     }
 
     /// If `key` has a parked ask AND `resolve` matches it, atomically clears
-    /// the parked ask + its resolver (so a concurrent duplicate resolution —
-    /// e.g. a button press racing a text reply — finds nothing left to
-    /// match) and returns the answer plus the channel to notify the waiting
-    /// render task on. `resolve` runs while holding the chat-state lock, so
-    /// it must be cheap and non-async (pure pattern matching against the
-    /// parked ask — see `approvals::match_text_answer`/`match_callback_data`).
+    /// the parked ask (so a concurrent duplicate resolution — e.g. a button
+    /// press racing a text reply — finds nothing left to match) and returns
+    /// what to do with the answer: hand it to the live waiting render task,
+    /// or — when this ask was re-parked by `resync_pending_asks` and has no
+    /// live task waiting (`ask_resolution` is `None`, bamboo issue #9) —
+    /// resolve it inline. In the resync case `busy` is set `true` in this
+    /// SAME lock acquisition, atomically with clearing the ask, so a message
+    /// racing in immediately behind this one queues instead of starting a
+    /// second concurrent run on the same session (mirrors `handle_inbound`'s
+    /// own busy-then-spawn dance for a fresh message). `resolve` runs while
+    /// holding the chat-state lock, so it must be cheap and non-async (pure
+    /// pattern matching against the parked ask — see
+    /// `approvals::match_text_answer`/`match_callback_data`).
     async fn try_resolve_pending_ask(
         &self,
         key: &str,
         resolve: impl FnOnce(&ParkedAsk) -> Option<String>,
-    ) -> Option<(String, mpsc::Sender<AskResolution>)> {
+    ) -> Option<PendingAskMatch> {
         let mut guard = self.chat_state.lock().await;
         let state = guard.get_mut(key)?;
         let ask_ref = state.pending_ask.as_ref()?;
         let answer = resolve(ask_ref)?;
-        let sender = state.ask_resolution.take()?;
-        state.pending_ask = None;
-        Some((answer, sender))
+        let parked = state.pending_ask.take().expect("checked Some above");
+        Some(match state.ask_resolution.take() {
+            Some(sender) => PendingAskMatch::Live(sender, answer),
+            None => {
+                state.busy = true;
+                PendingAskMatch::Resynced(parked, answer)
+            }
+        })
     }
 
     /// Clears `key`'s parked ask (if any) and wakes its waiting render task
@@ -426,11 +458,20 @@ impl ConnectBridge {
     /// magpie restart loses every in-memory `ChatState` (including any
     /// parked ask) while `session_map` survives on disk — if the underlying
     /// bamboo session was left paused on a question, this re-fetches it via
-    /// `GET /respond/{id}/pending` for every known chat key and re-parks +
-    /// re-renders it, so a user who answers after a magpie restart still
-    /// resolves the SAME question instead of the answer landing nowhere.
-    /// Best-effort: a chat whose session has no pending question (the common
-    /// case) or whose `respond_pending` call errors is silently skipped.
+    /// `GET /respond/{id}/pending` for every known chat key and re-parks it
+    /// (bookkeeping only — no `ReplyCtx` survives a restart to re-render the
+    /// ask as a fresh message, see the loop body), so a user who answers
+    /// after a magpie restart still resolves the SAME question instead of
+    /// the answer landing nowhere. This deliberately re-parks with NO
+    /// `ChatState::ask_resolution` sender (there is no live
+    /// `render_until_settled` task after a restart to be one) —
+    /// `try_resolve_pending_ask`/`handle_inbound`/`handle_callback` detect
+    /// that (`PendingAskMatch::Resynced`) and resolve a matching answer
+    /// inline via `resolve_resynced_ask` instead of falling through to the
+    /// normal busy/queue routing and starting an unrelated new run (bamboo
+    /// issue #9). Best-effort: a chat whose session has no pending question
+    /// (the common case) or whose `respond_pending` call errors is silently
+    /// skipped.
     pub async fn resync_pending_asks(
         self: &Arc<Self>,
         platforms: &HashMap<String, Arc<dyn Platform>>,
@@ -471,10 +512,16 @@ impl ConnectBridge {
             // is platform-specific (each adapter decides its own opaque
             // shape), so this resync only re-parks the bookkeeping; it does
             // NOT re-render the ask as a fresh outbound message (no
-            // `ReplyCtx` is recoverable from the session map alone). The
-            // user's next message to the chat still resolves it correctly
-            // via the normal ask-fast-path in `handle_inbound`, they just
-            // won't see a repeated prompt after a restart.
+            // `ReplyCtx` is recoverable from the session map alone), and
+            // leaves `ask_resolution` unset (there is no live render task to
+            // own it yet). The user's next message to the chat still
+            // resolves it correctly via the ask-fast-path in
+            // `handle_inbound`/`handle_callback` — a match against this
+            // ask, with `ask_resolution` still `None`, now takes the
+            // `PendingAskMatch::Resynced` path and resolves inline using
+            // the ANSWERING message's own `ReplyCtx` (see
+            // `resolve_resynced_ask`) — they just won't see a repeated
+            // prompt after a restart.
             let mut guard = self.chat_state.lock().await;
             let state = guard.entry(key.clone()).or_default();
             state.pending_ask = Some(parked);
@@ -556,12 +603,28 @@ impl ConnectBridge {
         // non-matching reply on a CLOSED ask (no free text allowed) falls
         // through to the normal busy/queue handling below, exactly like any
         // other message.
-        if let Some((answer, sender)) = self
+        match self
             .try_resolve_pending_ask(&key, |ask| approvals::match_text_answer(ask, &msg.text))
             .await
         {
-            let _ = sender.send(AskResolution::Answer(answer)).await;
-            return;
+            Some(PendingAskMatch::Live(sender, answer)) => {
+                let _ = sender.send(AskResolution::Answer(answer)).await;
+                return;
+            }
+            // Resynced ask (issue #9): no live render task to hand this to
+            // — resolve it inline instead of letting it fall through to a
+            // new run.
+            Some(PendingAskMatch::Resynced(parked, answer)) => {
+                let bridge = self.clone();
+                let reply_ctx = msg.reply_ctx.clone();
+                tokio::spawn(async move {
+                    bridge
+                        .resolve_resynced_ask(key, platform, reply_ctx, parked, answer)
+                        .await;
+                });
+                return;
+            }
+            None => {}
         }
 
         // `/new` is always an immediate escape hatch out of a parked ask
@@ -595,15 +658,25 @@ impl ConnectBridge {
     async fn drain_chat(
         self: Arc<Self>,
         key: String,
-        mut platform: Arc<dyn Platform>,
-        mut msg: InboundMessage,
+        platform: Arc<dyn Platform>,
+        msg: InboundMessage,
     ) {
-        loop {
-            self.process_one(&key, platform.clone(), msg).await;
+        self.process_one(&key, platform, msg).await;
+        self.drain_queue(&key).await;
+    }
 
+    /// Pops and processes `key`'s queued messages (FIFO) until the queue is
+    /// empty, at which point the chat is marked idle (`busy = false`)
+    /// again. The shared wind-down tail of both [`Self::drain_chat`] (a
+    /// freshly-started run finishing) and [`Self::resolve_resynced_ask`] (a
+    /// resumed post-restart run finishing, bamboo issue #9) — whichever one
+    /// set `busy = true`, the queue it may have backed up behind must still
+    /// get drained here rather than left orphaned.
+    async fn drain_queue(&self, key: &str) {
+        loop {
             let next = {
                 let mut guard = self.chat_state.lock().await;
-                match guard.get_mut(&key) {
+                match guard.get_mut(key) {
                     Some(state) => match state.queue.pop_front() {
                         Some(item) => Some(item),
                         None => {
@@ -616,10 +689,7 @@ impl ConnectBridge {
             };
 
             match next {
-                Some((p, m)) => {
-                    platform = p;
-                    msg = m;
-                }
+                Some((platform, msg)) => self.process_one(key, platform, msg).await,
                 None => break,
             }
         }
@@ -668,11 +738,29 @@ impl ConnectBridge {
             .await;
 
         match resolved {
-            Some((answer, sender)) => {
+            Some(PendingAskMatch::Live(sender, answer)) => {
                 let _ = platform
                     .answer_callback(&callback.callback_query_id, None)
                     .await;
                 let _ = sender.send(AskResolution::Answer(answer)).await;
+            }
+            // Resynced ask (issue #9): no live render task to hand this to
+            // — resolve it inline instead of dropping the press. In
+            // practice a resync-parked ask's nonce is freshly regenerated
+            // (never re-rendered as a message, so no stale pre-restart
+            // button can ever match it) — this arm mainly gives
+            // `PendingAskMatch` one consistent handler on both call sites.
+            Some(PendingAskMatch::Resynced(parked, answer)) => {
+                let _ = platform
+                    .answer_callback(&callback.callback_query_id, None)
+                    .await;
+                let bridge = self.clone();
+                let reply_ctx = callback.reply_ctx.clone();
+                tokio::spawn(async move {
+                    bridge
+                        .resolve_resynced_ask(key, platform, reply_ctx, parked, answer)
+                        .await;
+                });
             }
             None => {
                 tracing::debug!(
@@ -920,78 +1008,23 @@ impl ConnectBridge {
 
                     match ask_rx.recv().await {
                         Some(AskResolution::Answer(answer)) => {
-                            // Subscribe BEFORE respond — the same
-                            // subscribe-before-execute invariant the initial
-                            // run relies on (ARCHITECTURE.md). A server-side
-                            // resubscribe REPLACES the channel's forwarder
-                            // with a fresh broadcast cut, so subscribing
-                            // after `respond` leaves a window where the
-                            // resumed run's events — or, if the WS is mid-
-                            // reconnect while the Subscribe command waits,
-                            // the entire run through `Complete` — are
-                            // emitted into no subscription at all; the
-                            // render task then waits forever on an idle
-                            // channel and the final reply never renders
-                            // (issue #6). A failed subscribe still records
-                            // the answer below (the old degradation path):
-                            // dropping the user's decision is strictly worse
-                            // than rendering nothing.
-                            let new_rx = self.api.subscribe_session(session_id).await;
-                            let respond_request = RespondRequest {
-                                response: answer.clone(),
-                                ..Default::default()
-                            };
-                            match self.api.respond(session_id, respond_request).await {
-                                Ok(_response) => {
-                                    // Mark the ask message answered — ✅ +
-                                    // the chosen answer, buttons dropped (an
-                                    // edit replaces the whole message body) —
-                                    // so stale buttons can't be pressed again
-                                    // and the chat shows WHAT was chosen.
-                                    // Best-effort: an edit failure never
-                                    // fails the resume.
-                                    if caps.edit_message {
-                                        if let Some(msg_ref) = &ask_ref {
-                                            let done = format!("{ask_text}\n\n✅ {answer}");
-                                            if let Err(error) = platform
-                                                .edit(msg_ref, OutboundMessage::text(done))
-                                                .await
-                                            {
-                                                tracing::debug!(
-                                                    "magpie bridge: answered-ask edit failed \
-                                                     (non-fatal): {error}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    match new_rx {
-                                        Ok(new_rx) => {
-                                            rx = new_rx;
-                                            continue;
-                                        }
-                                        Err(error) => {
-                                            reply_text(
-                                                &platform,
-                                                &reply_ctx,
-                                                format!(
-                                                    "Answer recorded, but failed to resume \
-                                                     watching the run: {error}"
-                                                ),
-                                            )
-                                            .await;
-                                            return;
-                                        }
-                                    }
+                            let answered_ask =
+                                ask_ref.as_ref().map(|msg_ref| (msg_ref, ask_text.as_str()));
+                            match self
+                                .respond_and_resubscribe(
+                                    &platform,
+                                    &reply_ctx,
+                                    session_id,
+                                    &answer,
+                                    answered_ask,
+                                )
+                                .await
+                            {
+                                Some(new_rx) => {
+                                    rx = new_rx;
+                                    continue;
                                 }
-                                Err(error) => {
-                                    reply_text(
-                                        &platform,
-                                        &reply_ctx,
-                                        format!("Failed to record your answer: {error}"),
-                                    )
-                                    .await;
-                                    return;
-                                }
+                                None => return,
                             }
                         }
                         Some(AskResolution::Invalidated) | None => {
@@ -1007,6 +1040,128 @@ impl ConnectBridge {
                 }
             }
         }
+    }
+
+    /// Submits `answer` for `session_id`'s parked ask and returns the fresh
+    /// receiver to keep watching the (resumed) run on — the shared core of
+    /// resolving an ask, used both by [`Self::render_until_settled`]'s live
+    /// pause branch and by [`Self::resolve_resynced_ask`] (bamboo issue #9).
+    ///
+    /// Subscribes BEFORE responding — the same subscribe-before-execute
+    /// invariant the initial run relies on (ARCHITECTURE.md). A server-side
+    /// resubscribe REPLACES the channel's forwarder with a fresh broadcast
+    /// cut, so subscribing after `respond` leaves a window where the resumed
+    /// run's events — or, if the WS is mid-reconnect while the Subscribe
+    /// command waits, the entire run through `Complete` — are emitted into
+    /// no subscription at all; the render task would then wait forever on an
+    /// idle channel and the final reply never renders (issue #6). A failed
+    /// subscribe still records the answer below (the old degradation path):
+    /// dropping the user's decision is strictly worse than rendering
+    /// nothing.
+    ///
+    /// `answered_ask`, when `Some((msg_ref, ask_text))`, marks that
+    /// previously-rendered ask message answered — ✅ + the chosen answer,
+    /// buttons dropped (an edit replaces the whole message body) — so stale
+    /// buttons can't be pressed again and the chat shows WHAT was chosen.
+    /// Best-effort: an edit failure never fails the resume. `None` (the
+    /// resync case: no ask message was ever re-rendered after a restart, so
+    /// there is nothing to edit) simply skips this step.
+    ///
+    /// On any failure an explicit reply is already sent to the chat and
+    /// `None` is returned — callers must stop there, never silently fall
+    /// through to treating the failure as "start a new run".
+    async fn respond_and_resubscribe(
+        &self,
+        platform: &Arc<dyn Platform>,
+        reply_ctx: &ReplyCtx,
+        session_id: &str,
+        answer: &str,
+        answered_ask: Option<(&MessageRef, &str)>,
+    ) -> Option<mpsc::Receiver<StreamEvent>> {
+        let new_rx = self.api.subscribe_session(session_id).await;
+        let respond_request = RespondRequest {
+            response: answer.to_string(),
+            ..Default::default()
+        };
+        match self.api.respond(session_id, respond_request).await {
+            Ok(_response) => {
+                if platform.capabilities().edit_message {
+                    if let Some((msg_ref, ask_text)) = answered_ask {
+                        let done = format!("{ask_text}\n\n✅ {answer}");
+                        if let Err(error) =
+                            platform.edit(msg_ref, OutboundMessage::text(done)).await
+                        {
+                            tracing::debug!(
+                                "magpie bridge: answered-ask edit failed (non-fatal): {error}"
+                            );
+                        }
+                    }
+                }
+                match new_rx {
+                    Ok(new_rx) => Some(new_rx),
+                    Err(error) => {
+                        reply_text(
+                            platform,
+                            reply_ctx,
+                            format!(
+                                "Answer recorded, but failed to resume watching the run: {error}"
+                            ),
+                        )
+                        .await;
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                reply_text(
+                    platform,
+                    reply_ctx,
+                    format!("Failed to record your answer: {error}"),
+                )
+                .await;
+                None
+            }
+        }
+    }
+
+    /// Resolves an answer to a RESYNCED ask (bamboo issue #9):
+    /// `resync_pending_asks` re-parks a pending question after a restart
+    /// with no live `render_until_settled` task waiting on it — nothing to
+    /// hand the answer to via `ChatState::ask_resolution`. This runs the
+    /// same subscribe-before-respond resume [`Self::respond_and_resubscribe`]
+    /// uses on the live path, then keeps watching the resumed run through
+    /// [`Self::render_until_settled`] (looping for as many further
+    /// pause/answer cycles as it takes to reach a terminal state, exactly
+    /// like any other run) using the ANSWERING message's `reply_ctx` —
+    /// resync itself has no `ReplyCtx` to recover (see
+    /// `resync_pending_asks`'s doc comment), but the message that answers
+    /// the question always carries a fresh one. There is no `ask_ref` to
+    /// edit (resync never re-rendered the ask as a message), so the ✅-edit
+    /// step is skipped — there is nothing stale left visible to mark
+    /// answered.
+    ///
+    /// `try_resolve_pending_ask` already set `busy = true` for this chat
+    /// atomically with matching the answer (see its doc comment); this
+    /// drains the chat's queue at the end exactly like [`Self::drain_chat`]
+    /// does, so `busy` is correctly cleared and anything that queued up
+    /// behind this resolution still gets processed.
+    async fn resolve_resynced_ask(
+        self: Arc<Self>,
+        key: String,
+        platform: Arc<dyn Platform>,
+        reply_ctx: ReplyCtx,
+        parked: ParkedAsk,
+        answer: String,
+    ) {
+        let session_id = parked.session_id.clone();
+        if let Some(rx) = self
+            .respond_and_resubscribe(&platform, &reply_ctx, &session_id, &answer, None)
+            .await
+        {
+            self.render_until_settled(&key, platform, reply_ctx, &session_id, rx)
+                .await;
+        }
+        self.drain_queue(&key).await;
     }
 }
 
@@ -1145,6 +1300,12 @@ mod tests {
         next_id: AtomicUsize,
         chat_error: Option<String>,
         respond_error: Option<String>,
+        /// Canned `respond_pending` response (bamboo issue #9 tests):
+        /// `resync_pending_asks` reads this to re-park an ask as if a
+        /// restart had just happened. `None` (the default) means "no
+        /// pending question" for every session id, matching every other
+        /// existing test's assumption that resync is a no-op.
+        resync_pending: TokioMutex<Option<RespondPendingResponse>>,
     }
 
     impl FakeBambooApi {
@@ -1161,6 +1322,7 @@ mod tests {
                 next_id: AtomicUsize::new(1),
                 chat_error: None,
                 respond_error: None,
+                resync_pending: TokioMutex::new(None),
             })
         }
 
@@ -1177,7 +1339,15 @@ mod tests {
                 next_id: AtomicUsize::new(1),
                 chat_error: None,
                 respond_error: Some(reason.to_string()),
+                resync_pending: TokioMutex::new(None),
             })
+        }
+
+        /// Makes the next (and every subsequent) `respond_pending` call
+        /// return `response`, as if that session were left paused on a
+        /// question across a restart.
+        async fn set_resync_pending(&self, response: RespondPendingResponse) {
+            *self.resync_pending.lock().await = Some(response);
         }
 
         /// Fetch the currently-live sender for `session_id` (panics if no
@@ -1275,6 +1445,9 @@ mod tests {
                 .lock()
                 .await
                 .push(session_id.to_string());
+            if let Some(pending) = self.resync_pending.lock().await.clone() {
+                return Ok(pending);
+            }
             Ok(RespondPendingResponse {
                 has_pending_question: false,
                 question: None,
@@ -2034,6 +2207,315 @@ mod tests {
         wait_until(|| {
             let api = api.clone();
             async move { !api.stop_calls.lock().await.is_empty() }
+        })
+        .await;
+    }
+
+    // ---- resync path: answering a re-parked ask after a restart (bamboo issue #9) ----
+
+    fn resync_pending_question(options: Vec<&str>, allow_custom: bool) -> RespondPendingResponse {
+        RespondPendingResponse {
+            has_pending_question: true,
+            question: Some("Approve?".to_string()),
+            options: Some(options.into_iter().map(str::to_string).collect()),
+            allow_custom: Some(allow_custom),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("conclusion_with_options".to_string()),
+            source: None,
+        }
+    }
+
+    /// Seeds `bridge`'s session map with `key` -> `session_id` directly
+    /// (bypassing a `chat`/`execute` call) and runs `resync_pending_asks` —
+    /// simulating exactly what a real magpie restart leaves behind: a
+    /// persisted session map entry whose underlying bamboo session is
+    /// paused on a question, with a brand-new (in-memory) `ChatState`.
+    async fn seed_and_resync(
+        bridge: &Arc<ConnectBridge>,
+        platform: &Arc<FakePlatform>,
+        key: &str,
+        session_id: &str,
+    ) {
+        bridge.set_session_id_for_key(key, session_id).await;
+        let mut platforms: HashMap<String, Arc<dyn Platform>> = HashMap::new();
+        platforms.insert("fake".to_string(), platform.clone() as Arc<dyn Platform>);
+        bridge.resync_pending_asks(&platforms).await;
+    }
+
+    #[tokio::test]
+    async fn resync_parks_the_ask_with_no_live_resolver() {
+        let api = FakeBambooApi::new();
+        api.set_resync_pending(resync_pending_question(vec!["Approve", "Deny"], false))
+            .await;
+        let bridge = Arc::new(ConnectBridge::new(api.clone(), None));
+        let platform = FakePlatform::new("fake");
+        let key = key_for("1", "u1");
+
+        seed_and_resync(&bridge, &platform, &key, "sess-1").await;
+
+        assert!(bridge.has_pending_ask(&key).await);
+        assert_eq!(
+            api.respond_pending_calls.lock().await.as_slice(),
+            ["sess-1"]
+        );
+        // The gap issue #9 describes: re-parked with no live render task
+        // waiting, so no `ask_resolution` sender exists yet.
+        assert!(bridge
+            .chat_state
+            .lock()
+            .await
+            .get(&key)
+            .unwrap()
+            .ask_resolution
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn resync_text_answer_resumes_the_parked_run_instead_of_starting_a_new_one() {
+        let api = FakeBambooApi::new();
+        api.set_resync_pending(resync_pending_question(vec!["Approve", "Deny"], false))
+            .await;
+        let bridge = Arc::new(ConnectBridge::new(api.clone(), None));
+        let platform = FakePlatform::new("fake");
+        let key = key_for("1", "u1");
+
+        seed_and_resync(&bridge, &platform, &key, "sess-1").await;
+        assert!(bridge.has_pending_ask(&key).await);
+
+        bridge
+            .clone()
+            .handle_inbound(
+                platform.clone() as Arc<dyn Platform>,
+                vec!["u1".to_string()],
+                inbound("1", "u1", "m1", "yes"),
+            )
+            .await;
+
+        wait_until(|| {
+            let api = api.clone();
+            async move { api.respond_calls.lock().await.len() == 1 }
+        })
+        .await;
+        assert_eq!(
+            api.respond_calls.lock().await.as_slice(),
+            [("sess-1".to_string(), "Approve".to_string())]
+        );
+        assert_eq!(
+            api.ops.lock().await.as_slice(),
+            ["subscribe", "respond"],
+            "resync resume must subscribe before respond, exactly like the live path"
+        );
+        // The core regression: the matched answer must resolve the parked
+        // run inline, never fall through to `process_one`/`run_prompt` and
+        // start a brand new session on top of the still-suspended one.
+        assert!(
+            api.chat_calls.lock().await.is_empty(),
+            "a resync-matched answer must never start a new run via POST /chat"
+        );
+        assert!(api.execute_calls.lock().await.is_empty());
+        assert!(!bridge.has_pending_ask(&key).await);
+
+        // Let the resumed run finish so `busy` settles back to idle.
+        api.sender_for("sess-1")
+            .await
+            .send(StreamEvent::Agent(
+                crate::bamboo::types::AgentEvent::Complete { usage: usage() },
+            ))
+            .await
+            .unwrap();
+        wait_until(|| {
+            let bridge = bridge.clone();
+            let key = key.clone();
+            async move { !bridge.is_busy(&key).await }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resync_callback_answer_resumes_the_parked_run_instead_of_starting_a_new_one() {
+        let api = FakeBambooApi::new();
+        api.set_resync_pending(resync_pending_question(vec!["Approve", "Deny"], false))
+            .await;
+        let bridge = Arc::new(ConnectBridge::new(api.clone(), None));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("1", "u1");
+
+        seed_and_resync(&bridge, &platform, &key, "sess-1").await;
+        let parked = bridge
+            .chat_state
+            .lock()
+            .await
+            .get(&key)
+            .unwrap()
+            .pending_ask
+            .clone()
+            .expect("ask parked by resync");
+
+        let callback = CallbackQuery {
+            platform: "fake".to_string(),
+            chat_id: "1".to_string(),
+            user_id: "u1".to_string(),
+            callback_query_id: "cbq-1".to_string(),
+            data: format!("{}:0", parked.nonce),
+            reply_ctx: ReplyCtx(serde_json::json!({"chat_id": "1"})),
+        };
+        bridge
+            .clone()
+            .handle_callback(
+                platform.clone() as Arc<dyn Platform>,
+                vec!["u1".to_string()],
+                callback,
+            )
+            .await;
+
+        assert_eq!(platform.answered_callbacks.lock().await.len(), 1);
+        wait_until(|| {
+            let api = api.clone();
+            async move { api.respond_calls.lock().await.len() == 1 }
+        })
+        .await;
+        assert_eq!(api.respond_calls.lock().await[0].1, "Approve");
+        assert!(api.chat_calls.lock().await.is_empty());
+        assert!(api.execute_calls.lock().await.is_empty());
+
+        api.sender_for("sess-1")
+            .await
+            .send(StreamEvent::Agent(
+                crate::bamboo::types::AgentEvent::Complete { usage: usage() },
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resync_pre_restart_button_nonce_is_stale_and_reports_expired() {
+        // A resync always mints a FRESH nonce (bridge.rs never recovers the
+        // pre-restart message to re-render), so a press on the OLD button
+        // still visible in the chat can never match post-restart — the
+        // callback fast path's existing "This action has expired." handling
+        // covers it; this asserts that stays true for the resync case too,
+        // and that it never starts a stray new run either.
+        let api = FakeBambooApi::new();
+        api.set_resync_pending(resync_pending_question(vec!["Approve", "Deny"], false))
+            .await;
+        let bridge = Arc::new(ConnectBridge::new(api.clone(), None));
+        let platform = FakePlatform::with_capabilities("fake", buttons_and_edit_capabilities());
+        let key = key_for("1", "u1");
+
+        seed_and_resync(&bridge, &platform, &key, "sess-1").await;
+
+        let callback = CallbackQuery {
+            platform: "fake".to_string(),
+            chat_id: "1".to_string(),
+            user_id: "u1".to_string(),
+            callback_query_id: "cbq-1".to_string(),
+            data: "pre-restart-nonce:0".to_string(),
+            reply_ctx: ReplyCtx(serde_json::json!({"chat_id": "1"})),
+        };
+        bridge
+            .clone()
+            .handle_callback(
+                platform.clone() as Arc<dyn Platform>,
+                vec!["u1".to_string()],
+                callback,
+            )
+            .await;
+
+        let answered = platform.answered_callbacks.lock().await;
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0].1.as_deref(), Some("This action has expired."));
+        assert!(api.respond_calls.lock().await.is_empty());
+        assert!(api.chat_calls.lock().await.is_empty());
+        // The genuinely-parked ask (fresh nonce) must still be there,
+        // untouched by the stale press.
+        assert!(bridge.has_pending_ask(&key).await);
+    }
+
+    #[tokio::test]
+    async fn resync_answer_marks_the_chat_busy_and_drains_a_message_queued_behind_it() {
+        let api = FakeBambooApi::new();
+        api.set_resync_pending(resync_pending_question(vec!["Approve", "Deny"], false))
+            .await;
+        let bridge = Arc::new(ConnectBridge::new(api.clone(), None));
+        let platform = FakePlatform::new("fake");
+        let key = key_for("1", "u1");
+
+        seed_and_resync(&bridge, &platform, &key, "sess-1").await;
+        assert!(!bridge.is_busy(&key).await, "merely parked, not yet busy");
+
+        bridge
+            .clone()
+            .handle_inbound(
+                platform.clone() as Arc<dyn Platform>,
+                vec!["u1".to_string()],
+                inbound("1", "u1", "m1", "yes"),
+            )
+            .await;
+
+        // The resolving answer atomically marks the chat busy (mirrors
+        // `handle_inbound`'s own busy-then-spawn dance for a fresh
+        // message) — an unrelated message arriving right behind it must
+        // queue rather than race a second run onto the same session.
+        wait_until(|| {
+            let bridge = bridge.clone();
+            let key = key.clone();
+            async move { bridge.is_busy(&key).await }
+        })
+        .await;
+        bridge
+            .clone()
+            .handle_inbound(
+                platform.clone() as Arc<dyn Platform>,
+                vec!["u1".to_string()],
+                inbound("1", "u1", "m2", "a follow-up message"),
+            )
+            .await;
+
+        // Finish the resumed (resync) run.
+        wait_until(|| {
+            let api = api.clone();
+            async move { api.respond_calls.lock().await.len() == 1 }
+        })
+        .await;
+        api.sender_for("sess-1")
+            .await
+            .send(StreamEvent::Agent(
+                crate::bamboo::types::AgentEvent::Complete { usage: usage() },
+            ))
+            .await
+            .unwrap();
+
+        // The queued follow-up message must still get processed — as its
+        // own new run on the same (now-idle) session — instead of being
+        // orphaned in the queue forever.
+        wait_until(|| {
+            let api = api.clone();
+            async move { !api.chat_calls.lock().await.is_empty() }
+        })
+        .await;
+        assert_eq!(
+            api.chat_calls.lock().await[0].message,
+            "a follow-up message"
+        );
+
+        // End the follow-up run too so its background task doesn't linger
+        // past the test.
+        wait_until(|| {
+            let api = api.clone();
+            async move { api.execute_calls.lock().await.len() == 1 }
+        })
+        .await;
+        api.sender_for("sess-1")
+            .await
+            .send(StreamEvent::Agent(
+                crate::bamboo::types::AgentEvent::Complete { usage: usage() },
+            ))
+            .await
+            .unwrap();
+        wait_until(|| {
+            let bridge = bridge.clone();
+            let key = key.clone();
+            async move { !bridge.is_busy(&key).await }
         })
         .await;
     }
