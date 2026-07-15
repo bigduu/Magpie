@@ -312,6 +312,12 @@ fn escape_feishu_markdown(text: &str) -> String {
 /// adapter's own choice: the plan pins ONLY the `behaviors`/`value.cb`
 /// shape, not the surrounding container, so this is the one place protocol
 /// shape was inferred rather than verified — flagged in the task report.
+///
+/// Schema 2.0 nests `elements` under `body` — a TOP-LEVEL `elements` key is
+/// the v1 location and the real API rejects it with
+/// `200621 parse card json err: unknown property "elements" at path []`
+/// (caught live in the 2026-07-15 real-device e2e; the wiremock tests can't
+/// see this because they don't validate Feishu's card schema).
 fn build_card(text: &str, buttons: Option<&[Vec<Button>]>) -> serde_json::Value {
     let mut elements = vec![serde_json::json!({
         "tag": "markdown",
@@ -341,7 +347,7 @@ fn build_card(text: &str, buttons: Option<&[Vec<Button>]>) -> serde_json::Value 
     serde_json::json!({
         "schema": "2.0",
         "config": { "update_multi": true },
-        "elements": elements,
+        "body": { "elements": elements },
     })
 }
 
@@ -756,7 +762,7 @@ mod tests {
                 .unwrap();
         assert_eq!(content["schema"], serde_json::json!("2.0"));
         assert_eq!(content["config"]["update_multi"], serde_json::json!(true));
-        let markdown_content = content["elements"][0]["content"].as_str().unwrap();
+        let markdown_content = content["body"]["elements"][0]["content"].as_str().unwrap();
         assert!(
             markdown_content.contains("\\*world\\*"),
             "got: {markdown_content}"
@@ -795,7 +801,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&send_request.body).unwrap();
         let content: serde_json::Value =
             serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
-        let action = &content["elements"][1];
+        let action = &content["body"]["elements"][1];
         assert_eq!(action["tag"], serde_json::json!("action"));
         assert_eq!(
             action["actions"][0]["behaviors"][0]["value"]["cb"],
@@ -866,7 +872,7 @@ mod tests {
         let content: serde_json::Value =
             serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
         assert_eq!(
-            content["elements"][0]["content"],
+            content["body"]["elements"][0]["content"],
             serde_json::json!("updated")
         );
     }
