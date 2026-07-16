@@ -864,19 +864,34 @@ impl ConnectBridge {
 
     /// `/stop`: if the chat is currently busy (a run is executing OR paused
     /// on a parked ask — both count as "busy" for the whole duration a
-    /// `run_prompt` call is in flight, see [`Self::render_until_settled`]),
-    /// invalidate any parked ask (unblocks a waiting render task
-    /// immediately) and call [`BambooApi::stop`] on the session — harmless
-    /// to call even if the session is only paused server-side (the server is
-    /// the authority on whether there's anything to actually cancel).
+    /// `run_prompt` call is in flight, see [`Self::render_until_settled`]) OR
+    /// has a parked ask that a magpie restart re-parked WITHOUT ever setting
+    /// `busy` (`resync_pending_asks`, bamboo issue #9 / magpie issue #14 —
+    /// such an ask has no live render task holding the session "busy", so
+    /// `busy` alone under-reports it), tell the server to cancel the session
+    /// via [`BambooApi::stop`] — harmless to call even if the session is
+    /// only paused server-side (the server is the authority on whether
+    /// there's anything to actually cancel).
+    ///
+    /// The server cancel is issued BEFORE any local state
+    /// (`invalidate_pending_ask`) is cleared: `session_id_for_key` is read
+    /// up front (unaffected by ask invalidation — only session rotation
+    /// removes it, and `/stop` never rotates), then `api.stop` is awaited,
+    /// and only THEN is the local ask cleared. If `api.stop` fails, the local
+    /// pending-ask is still cleared afterwards (best-effort/log-only, same
+    /// as the pre-existing busy-path precedent) rather than leaving the chat
+    /// stuck reporting a stale parked ask — but clearing only happens after
+    /// the cancel attempt so a slow/failed call never races a queued message
+    /// into starting a second concurrent run on the same still-live session.
     ///
     /// Port note: bamboo's in-proc version distinguishes "a live task's
     /// `cancel_token` exists" from "only a parked ask, no live task" (a
     /// paused round has no in-proc task to cancel). Magpie has no local
-    /// cancel token — `busy` alone (which stays `true` for the whole
-    /// paused-and-waiting window, see `render_until_settled`) is what gates
-    /// whether `/stop` calls the API, so both of those in-proc cases collapse
-    /// into one magpie case; see the final report's judgment-call notes.
+    /// cancel token — `busy || pending_ask.is_some()` is what gates whether
+    /// `/stop` calls the API, collapsing both in-proc cases into one magpie
+    /// case (plus the resync-parked case, which is unique to magpie's
+    /// restart-survives-the-session-map design); see the final report's
+    /// judgment-call notes.
     ///
     /// Returns `true` when the caller must drain `key`'s queue afterwards
     /// (magpie issue #12: `invalidate_pending_ask` found a RESYNCED ask —
@@ -888,19 +903,33 @@ impl ConnectBridge {
         reply_ctx: &ReplyCtx,
     ) -> bool {
         let had_pending_ask = self.has_pending_ask(key).await;
+        let busy = self.is_busy(key).await;
+        let session_id = self.session_id_for_key(key).await;
+
+        // magpie issue #14: gate the server-side cancel on `busy` OR a
+        // parked ask, not `busy` alone — a resync-parked ask never sets
+        // `busy` (see `resync_pending_asks`'s doc comment) but still
+        // corresponds to a live, server-side-suspended session that must be
+        // told to cancel, not just forgotten locally.
+        if busy || had_pending_ask {
+            if let Some(session_id) = &session_id {
+                if let Err(error) = self.api.stop(session_id).await {
+                    tracing::warn!("magpie bridge: failed to stop session {session_id}: {error}");
+                }
+            }
+        }
+
+        // Only clear local state (and hand the caller a drain obligation)
+        // AFTER the server has been asked to cancel — see this fn's doc
+        // comment on ordering.
         let needs_drain = if had_pending_ask {
             self.invalidate_pending_ask(key).await
         } else {
             false
         };
-        let busy = self.is_busy(key).await;
-        let session_id = self.session_id_for_key(key).await;
 
         match (busy, session_id) {
-            (true, Some(session_id)) => {
-                if let Err(error) = self.api.stop(&session_id).await {
-                    tracing::warn!("magpie bridge: failed to stop session {session_id}: {error}");
-                }
+            (true, Some(_)) => {
                 reply_text(platform, reply_ctx, "Stopping the current run…").await;
             }
             _ if had_pending_ask => {
@@ -1795,7 +1824,7 @@ mod tests {
     #[tokio::test]
     async fn stop_with_nothing_running_replies_nothing_running() {
         let api = FakeBambooApi::new();
-        let bridge = Arc::new(ConnectBridge::new(api, None));
+        let bridge = Arc::new(ConnectBridge::new(api.clone(), None));
         let platform = FakePlatform::new("fake");
 
         bridge
@@ -1810,6 +1839,10 @@ mod tests {
         let sent = platform.sent_texts().await;
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0], "Nothing is running.");
+        assert!(
+            api.stop_calls.lock().await.is_empty(),
+            "/stop with nothing pending must not call the API"
+        );
     }
 
     // ---- prompt -> session mapping, /new, session-map persistence ----
@@ -2802,6 +2835,15 @@ mod tests {
         assert!(
             api.respond_calls.lock().await.is_empty(),
             "/stop must never submit an answer"
+        );
+        // magpie issue #14: a resync-parked ask never set `busy`, so
+        // `handle_stop` used to skip `BambooApi::stop` entirely for this
+        // exact case, clearing local state without ever telling the server
+        // to cancel the still-suspended session.
+        assert_eq!(
+            *api.stop_calls.lock().await,
+            vec!["sess-1".to_string()],
+            "/stop on a resync-parked (never-busy) ask must still cancel the server session"
         );
 
         // The queued backlog message must still get drained (against the
