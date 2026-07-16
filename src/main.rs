@@ -238,6 +238,11 @@ async fn main() -> std::process::ExitCode {
         }
     }
 
+    // Magpie issue #12: `ChatState` (parked asks + queued messages) is
+    // in-memory only and lost on exit — log anything still outstanding so
+    // an operator sees it instead of a message silently vanishing.
+    bridge.log_backlog_on_shutdown().await;
+
     std::process::ExitCode::SUCCESS
 }
 
