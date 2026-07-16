@@ -347,13 +347,21 @@ impl ConnectBridge {
     /// parked ask first (bamboo issue #458: "`/new` and session rotation
     /// invalidate parked asks") — an ask answered after its session has been
     /// rotated away would resolve a question nobody can see anymore.
-    async fn rotate_session(&self, key: &str) {
-        self.invalidate_pending_ask(key).await;
+    ///
+    /// Returns `true` when the caller must drain `key`'s queue afterwards
+    /// (magpie issue #12: a RESYNCED parked ask — see
+    /// `invalidate_pending_ask`'s doc comment) — deliberately done AFTER the
+    /// session map is cleared (not inside `invalidate_pending_ask` itself) so
+    /// any queued message drains against the FRESH (post-rotation) session,
+    /// matching what a user typing it after `/new` would get.
+    async fn rotate_session(&self, key: &str) -> bool {
+        let needs_drain = self.invalidate_pending_ask(key).await;
         {
             let mut map = self.session_map.write().await;
             map.remove(key);
         }
         self.persist_session_map().await;
+        needs_drain
     }
 
     /// Whether `key`'s chat currently has a parked ask awaiting resolution.
@@ -409,19 +417,35 @@ impl ConnectBridge {
 
     /// Clears `key`'s parked ask (if any) and wakes its waiting render task
     /// with [`AskResolution::Invalidated`] instead of an answer.
-    async fn invalidate_pending_ask(&self, key: &str) {
-        let sender = {
+    ///
+    /// Returns `true` when the cleared ask had NO live render task waiting
+    /// on it — the `resync_pending_asks` case (bamboo issue #9) — because
+    /// such an ask never set `busy = true` (see `handle_inbound`'s
+    /// pending-ask queueing, added for magpie issue #12): any message that
+    /// queued up behind it while parked would otherwise sit forever with
+    /// nothing to drain it. This deliberately does NOT drain the queue
+    /// itself — the caller may need to finish its own state changes first
+    /// (e.g. `rotate_session` clearing the session map before a queued
+    /// message replays against it) and must drain from a detached task
+    /// rather than blocking (mirrors `drain_chat`'s own spawn) — so it just
+    /// signals the need and leaves the "when"/"how" to the caller.
+    async fn invalidate_pending_ask(&self, key: &str) -> bool {
+        let (had_ask, sender) = {
             let mut guard = self.chat_state.lock().await;
             match guard.get_mut(key) {
-                Some(state) => {
-                    state.pending_ask = None;
-                    state.ask_resolution.take()
-                }
-                None => None,
+                Some(state) => (
+                    state.pending_ask.take().is_some(),
+                    state.ask_resolution.take(),
+                ),
+                None => (false, None),
             }
         };
-        if let Some(sender) = sender {
-            let _ = sender.send(AskResolution::Invalidated).await;
+        match sender {
+            Some(sender) => {
+                let _ = sender.send(AskResolution::Invalidated).await;
+                false
+            }
+            None => had_ask,
         }
     }
 
@@ -530,6 +554,22 @@ impl ConnectBridge {
         }
     }
 
+    /// Spawns a detached task to drain `key`'s queue — used after
+    /// invalidating a RESYNCED parked ask (magpie issue #12:
+    /// `invalidate_pending_ask` returned `true`, meaning no live render task
+    /// ever set `busy = true` for it, so nothing else will drain whatever
+    /// queued up behind it while parked). Detached rather than awaited
+    /// inline so the (potentially long-running) drain never blocks the
+    /// caller — `handle_inbound` must return quickly, see its own doc
+    /// comment.
+    fn spawn_drain_queue(self: &Arc<Self>, key: &str) {
+        let bridge = self.clone();
+        let key = key.to_string();
+        tokio::spawn(async move {
+            bridge.drain_queue(&key).await;
+        });
+    }
+
     /// Entry point for every inbound platform message. Enforces allow-list +
     /// dedup, answers `/stop` and `/status` immediately (bypassing the busy
     /// queue — a queued `/stop` could never reach a busy chat), and otherwise
@@ -588,7 +628,9 @@ impl ConnectBridge {
 
         let command = strip_command_suffix(msg.text.trim());
         if command.eq_ignore_ascii_case("/stop") {
-            self.handle_stop(&key, &platform, &msg.reply_ctx).await;
+            if self.handle_stop(&key, &platform, &msg.reply_ctx).await {
+                self.spawn_drain_queue(&key);
+            }
             return;
         }
         if command.eq_ignore_ascii_case("/status") {
@@ -632,14 +674,28 @@ impl ConnectBridge {
         // on an answer nobody typed correctly) — the ordinary `/new` path in
         // `process_one` still handles the non-paused case unchanged.
         if command.eq_ignore_ascii_case("/new") && self.has_pending_ask(&key).await {
-            self.rotate_session(&key).await;
+            let needs_drain = self.rotate_session(&key).await;
             reply_text(&platform, &msg.reply_ctx, "Started a new session.").await;
+            if needs_drain {
+                self.spawn_drain_queue(&key);
+            }
             return;
         }
 
+        // magpie issue #12: a parked ask — whether a LIVE one (`busy` is
+        // already `true` for its whole paused-and-waiting window, see
+        // `render_until_settled`) or a RESYNCED one with no live render task
+        // yet (`resync_pending_asks`, bamboo issue #9 — `busy` is still
+        // `false` here) — means the underlying session is suspended
+        // server-side. A message that reaches this point already failed to
+        // match the parked ask above, so it is UNRELATED to it: queue it
+        // instead of starting a second concurrent run on a session that's
+        // still waiting on an answer. `try_resolve_pending_ask`'s answer path
+        // and `invalidate_pending_ask`'s `/stop`/`/new` paths are what
+        // eventually drain this queue (see their doc comments).
         let mut guard = self.chat_state.lock().await;
         let state = guard.entry(key.clone()).or_default();
-        if state.busy {
+        if state.busy || state.pending_ask.is_some() {
             state.queue.push_back((platform, msg));
             return;
         }
@@ -781,7 +837,19 @@ impl ConnectBridge {
     async fn process_one(&self, key: &str, platform: Arc<dyn Platform>, msg: InboundMessage) {
         let command = strip_command_suffix(msg.text.trim());
         if command.eq_ignore_ascii_case("/new") {
-            self.rotate_session(key).await;
+            // A message only ever reaches `process_one` via `drain_chat`
+            // (the message that started this very run) or `drain_queue`
+            // (something that queued behind it) — either way,
+            // `handle_inbound`'s own `/new`-while-parked fast path already
+            // intercepts a `/new` sent while a pending ask exists, before it
+            // ever reaches the queue (see that fast path's doc comment). So
+            // `rotate_session`'s `needs_drain` is always `false` here: there
+            // is nothing left for it to have invalidated.
+            let _needs_drain = self.rotate_session(key).await;
+            debug_assert!(
+                !_needs_drain,
+                "a /new popped off the queue should never find a parked ask left to invalidate"
+            );
             reply_text(&platform, &msg.reply_ctx, "Started a new session.").await;
             return;
         }
@@ -809,11 +877,22 @@ impl ConnectBridge {
     /// paused-and-waiting window, see `render_until_settled`) is what gates
     /// whether `/stop` calls the API, so both of those in-proc cases collapse
     /// into one magpie case; see the final report's judgment-call notes.
-    async fn handle_stop(&self, key: &str, platform: &Arc<dyn Platform>, reply_ctx: &ReplyCtx) {
+    ///
+    /// Returns `true` when the caller must drain `key`'s queue afterwards
+    /// (magpie issue #12: `invalidate_pending_ask` found a RESYNCED ask —
+    /// see its doc comment).
+    async fn handle_stop(
+        &self,
+        key: &str,
+        platform: &Arc<dyn Platform>,
+        reply_ctx: &ReplyCtx,
+    ) -> bool {
         let had_pending_ask = self.has_pending_ask(key).await;
-        if had_pending_ask {
-            self.invalidate_pending_ask(key).await;
-        }
+        let needs_drain = if had_pending_ask {
+            self.invalidate_pending_ask(key).await
+        } else {
+            false
+        };
         let busy = self.is_busy(key).await;
         let session_id = self.session_id_for_key(key).await;
 
@@ -836,6 +915,7 @@ impl ConnectBridge {
                 reply_text(platform, reply_ctx, "Nothing is running.").await;
             }
         }
+        needs_drain
     }
 
     async fn handle_status(&self, key: &str, platform: &Arc<dyn Platform>, reply_ctx: &ReplyCtx) {
@@ -1162,6 +1242,33 @@ impl ConnectBridge {
                 .await;
         }
         self.drain_queue(&key).await;
+    }
+
+    /// Best-effort operational visibility for a graceful shutdown (magpie
+    /// issue #12): `ChatState` — a chat's parked ask and its queued
+    /// messages — lives only in memory (unlike `session_map`, which is
+    /// persisted to disk), so any chat still parked and/or backed up when
+    /// the process exits loses that state with nothing to recover it on the
+    /// next start beyond `resync_pending_asks` re-parking the ask itself
+    /// (which does NOT recover queued messages — see its doc comment). This
+    /// can't save them; it just logs a warning per affected chat so an
+    /// operator sees why a user's message never got a reply instead of it
+    /// silently vanishing. Call once, right before exiting.
+    pub async fn log_backlog_on_shutdown(&self) {
+        let guard = self.chat_state.lock().await;
+        for (key, state) in guard.iter() {
+            if state.pending_ask.is_none() && state.queue.is_empty() {
+                continue;
+            }
+            tracing::warn!(
+                chat = %key,
+                has_pending_ask = state.pending_ask.is_some(),
+                queued_messages = state.queue.len(),
+                "magpie bridge: shutting down with a parked ask and/or queued messages still \
+                 outstanding for this chat — queued messages will be lost (a parked ask itself \
+                 survives restart via resync_pending_asks, but nothing queued behind it does)"
+            );
+        }
     }
 }
 
@@ -2518,5 +2625,320 @@ mod tests {
             async move { !bridge.is_busy(&key).await }
         })
         .await;
+    }
+
+    // ---- magpie issue #12: queue (don't run) while a resync-parked ask has no live task yet ----
+
+    #[tokio::test]
+    async fn unrelated_message_in_the_resync_parked_window_queues_instead_of_starting_a_run() {
+        let api = FakeBambooApi::new();
+        api.set_resync_pending(resync_pending_question(vec!["Approve", "Deny"], false))
+            .await;
+        let bridge = Arc::new(ConnectBridge::new(api.clone(), None));
+        let platform = FakePlatform::new("fake");
+        let key = key_for("1", "u1");
+
+        seed_and_resync(&bridge, &platform, &key, "sess-1").await;
+        assert!(bridge.has_pending_ask(&key).await);
+        assert!(
+            !bridge.is_busy(&key).await,
+            "the exact window issue #12 describes: parked but not yet busy"
+        );
+
+        // An unrelated message — doesn't match "Approve"/"Deny" by index,
+        // exact text, or the binary keyword mapping — arrives BEFORE any
+        // answer. Before the fix this fell through to normal busy/queue
+        // routing (busy == false) and started a brand new concurrent run on
+        // top of the still-suspended session.
+        bridge
+            .clone()
+            .handle_inbound(
+                platform.clone() as Arc<dyn Platform>,
+                vec!["u1".to_string()],
+                inbound("1", "u1", "m1", "what's the weather like"),
+            )
+            .await;
+
+        // It must be queued, not run: no new POST /chat, ask still parked,
+        // still not busy (queueing alone never flips `busy`).
+        assert!(
+            api.chat_calls.lock().await.is_empty(),
+            "an unrelated message during the parked-but-not-yet-busy window must never start a \
+             concurrent run"
+        );
+        assert!(bridge.has_pending_ask(&key).await);
+        assert_eq!(
+            bridge
+                .chat_state
+                .lock()
+                .await
+                .get(&key)
+                .unwrap()
+                .queue
+                .len(),
+            1
+        );
+
+        // Now the real answer arrives and resolves the parked ask inline
+        // (the resync path, bamboo issue #9).
+        bridge
+            .clone()
+            .handle_inbound(
+                platform.clone() as Arc<dyn Platform>,
+                vec!["u1".to_string()],
+                inbound("1", "u1", "m2", "yes"),
+            )
+            .await;
+
+        wait_until(|| {
+            let api = api.clone();
+            async move { api.respond_calls.lock().await.len() == 1 }
+        })
+        .await;
+        assert_eq!(
+            api.respond_calls.lock().await.as_slice(),
+            [("sess-1".to_string(), "Approve".to_string())]
+        );
+        assert!(!bridge.has_pending_ask(&key).await);
+
+        // Finish the resumed run — its own `drain_queue` tail must now pick
+        // up the earlier queued message rather than orphaning it.
+        api.sender_for("sess-1")
+            .await
+            .send(StreamEvent::Agent(
+                crate::bamboo::types::AgentEvent::Complete { usage: usage() },
+            ))
+            .await
+            .unwrap();
+
+        wait_until(|| {
+            let api = api.clone();
+            async move { !api.chat_calls.lock().await.is_empty() }
+        })
+        .await;
+        assert_eq!(
+            api.chat_calls.lock().await[0].message,
+            "what's the weather like"
+        );
+
+        // Let the drained follow-up run finish too, so no task lingers past
+        // the test.
+        wait_until(|| {
+            let api = api.clone();
+            async move { api.execute_calls.lock().await.len() == 1 }
+        })
+        .await;
+        api.sender_for("sess-1")
+            .await
+            .send(StreamEvent::Agent(
+                crate::bamboo::types::AgentEvent::Complete { usage: usage() },
+            ))
+            .await
+            .unwrap();
+        wait_until(|| {
+            let bridge = bridge.clone();
+            let key = key.clone();
+            async move { !bridge.is_busy(&key).await }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stop_while_resync_parked_and_not_yet_busy_still_drains_the_queued_backlog() {
+        let api = FakeBambooApi::new();
+        api.set_resync_pending(resync_pending_question(vec!["Approve", "Deny"], false))
+            .await;
+        let bridge = Arc::new(ConnectBridge::new(api.clone(), None));
+        let platform = FakePlatform::new("fake");
+        let key = key_for("1", "u1");
+
+        seed_and_resync(&bridge, &platform, &key, "sess-1").await;
+
+        // Queue an unrelated message behind the parked (not-yet-busy) ask.
+        bridge
+            .clone()
+            .handle_inbound(
+                platform.clone() as Arc<dyn Platform>,
+                vec!["u1".to_string()],
+                inbound("1", "u1", "m1", "unrelated backlog message"),
+            )
+            .await;
+        assert_eq!(
+            bridge
+                .chat_state
+                .lock()
+                .await
+                .get(&key)
+                .unwrap()
+                .queue
+                .len(),
+            1
+        );
+
+        // The ask never gets answered — the user gives up and sends /stop
+        // instead ("ask expired/stale nonce" resolution path). Before the
+        // fix nothing would ever drain the backlog: `busy` was never set
+        // `true` for a resync-parked ask, and `invalidate_pending_ask` used
+        // to just drop the pending ask on the floor.
+        bridge
+            .clone()
+            .handle_inbound(
+                platform.clone() as Arc<dyn Platform>,
+                vec!["u1".to_string()],
+                inbound("1", "u1", "m2", "/stop"),
+            )
+            .await;
+
+        wait_until(|| {
+            let bridge = bridge.clone();
+            let key = key.clone();
+            async move { !bridge.has_pending_ask(&key).await }
+        })
+        .await;
+        let sent = platform.sent_texts().await;
+        assert!(sent
+            .iter()
+            .any(|t| t == "Stopped — the pending question was cancelled."));
+        assert!(
+            api.respond_calls.lock().await.is_empty(),
+            "/stop must never submit an answer"
+        );
+
+        // The queued backlog message must still get drained (against the
+        // untouched session — /stop doesn't rotate it) rather than sitting
+        // forever with `busy` stuck reporting idle while the queue is
+        // secretly non-empty.
+        wait_until(|| {
+            let api = api.clone();
+            async move { !api.chat_calls.lock().await.is_empty() }
+        })
+        .await;
+        assert_eq!(
+            api.chat_calls.lock().await[0].message,
+            "unrelated backlog message"
+        );
+        assert_eq!(
+            api.chat_calls.lock().await[0].session_id.as_deref(),
+            Some("sess-1")
+        );
+
+        wait_until(|| {
+            let api = api.clone();
+            async move { api.execute_calls.lock().await.len() == 1 }
+        })
+        .await;
+        api.sender_for("sess-1")
+            .await
+            .send(StreamEvent::Agent(
+                crate::bamboo::types::AgentEvent::Complete { usage: usage() },
+            ))
+            .await
+            .unwrap();
+        wait_until(|| {
+            let bridge = bridge.clone();
+            let key = key.clone();
+            async move { !bridge.is_busy(&key).await }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn new_command_while_resync_parked_drains_the_queued_backlog_onto_the_fresh_session() {
+        let api = FakeBambooApi::new();
+        api.set_resync_pending(resync_pending_question(vec!["Approve", "Deny"], false))
+            .await;
+        let bridge = Arc::new(ConnectBridge::new(api.clone(), None));
+        let platform = FakePlatform::new("fake");
+        let key = key_for("1", "u1");
+
+        seed_and_resync(&bridge, &platform, &key, "sess-1").await;
+
+        bridge
+            .clone()
+            .handle_inbound(
+                platform.clone() as Arc<dyn Platform>,
+                vec!["u1".to_string()],
+                inbound("1", "u1", "m1", "unrelated backlog message"),
+            )
+            .await;
+        assert_eq!(
+            bridge
+                .chat_state
+                .lock()
+                .await
+                .get(&key)
+                .unwrap()
+                .queue
+                .len(),
+            1
+        );
+
+        // `/new` always takes the immediate-escape-hatch fast path while a
+        // parked ask exists (bamboo issue #458), regardless of `busy`.
+        bridge
+            .clone()
+            .handle_inbound(
+                platform.clone() as Arc<dyn Platform>,
+                vec!["u1".to_string()],
+                inbound("1", "u1", "m2", "/new"),
+            )
+            .await;
+
+        wait_until(|| {
+            let bridge = bridge.clone();
+            let key = key.clone();
+            async move { !bridge.has_pending_ask(&key).await }
+        })
+        .await;
+        assert!(bridge.session_id_for_key(&key).await.is_none());
+
+        // The queued backlog message must drain against the FRESH
+        // (post-rotation) session, not the abandoned one — i.e. as a
+        // brand-new `POST /chat` with no `session_id`.
+        wait_until(|| {
+            let api = api.clone();
+            async move { !api.chat_calls.lock().await.is_empty() }
+        })
+        .await;
+        let chat_calls = api.chat_calls.lock().await;
+        assert_eq!(chat_calls[0].message, "unrelated backlog message");
+        assert_eq!(chat_calls[0].session_id, None);
+        drop(chat_calls);
+
+        wait_until(|| {
+            let api = api.clone();
+            async move { api.execute_calls.lock().await.len() == 1 }
+        })
+        .await;
+        // `FakeBambooApi::chat` mints new ids from its own counter — which
+        // was never advanced by `seed_and_resync`'s manual seeding, so the
+        // fresh id can coincidentally collide with the string "sess-1";
+        // what actually matters (checked above) is that the drained
+        // message's `POST /chat` carried NO `session_id`, i.e. a genuinely
+        // new session, not a reuse of the abandoned one.
+        let new_session_id = bridge.session_id_for_key(&key).await.unwrap();
+        api.sender_for(&new_session_id)
+            .await
+            .send(StreamEvent::Agent(
+                crate::bamboo::types::AgentEvent::Complete { usage: usage() },
+            ))
+            .await
+            .unwrap();
+        wait_until(|| {
+            let bridge = bridge.clone();
+            let key = key.clone();
+            async move { !bridge.is_busy(&key).await }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn log_backlog_on_shutdown_is_a_noop_when_nothing_is_outstanding() {
+        // No tracing-output assertion (would need a custom subscriber); this
+        // just pins down that the method is safe to call unconditionally at
+        // shutdown, including against an empty/never-touched bridge.
+        let api = FakeBambooApi::new();
+        let bridge = Arc::new(ConnectBridge::new(api, None));
+        bridge.log_backlog_on_shutdown().await;
     }
 }
