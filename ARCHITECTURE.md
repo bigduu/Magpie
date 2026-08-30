@@ -1,13 +1,26 @@
 # Magpie (鹊) — architecture
 
-Magpie is the standalone IM connector for Bamboo (extraction of bamboo-server's
-in-process `connect/` module, per bamboo epic #477). Named after 鹊桥 — the
-magpie bridge that spans between worlds.
+Magpie is the standalone IM connector for
+[Bamboo](https://github.com/bigduu/Bamboo-agent) (extraction of bamboo-server's
+in-process `connect/` module, per
+[Bamboo #477](https://github.com/bigduu/Bamboo-agent/issues/477)). Named after
+鹊桥 — the magpie bridge that spans between worlds.
 
 It drives Bamboo agent sessions from IM platforms (Telegram, Feishu/Lark)
 exclusively over **Bamboo's public API** — never in-process internals — and
 ships as a Bamboo **service plugin** (bamboo-plugin `services` artifact kind,
-bamboo #479): bamboo-server installs, spawns, supervises, and restarts it.
+[Bamboo #479](https://github.com/bigduu/Bamboo-agent/issues/479)): bamboo-server
+installs, spawns, supervises, and restarts it.
+
+## Distribution boundary
+
+Each GitHub release contains a `magpie-plugin-v<version>.tar.gz` bundle for
+`bamboo plugin install` and separate `magpie-v<version>-<target>.*`
+standalone archives. Installing the plugin bundle delegates platform-binary
+selection and process lifecycle to Bamboo; running a standalone binary leaves
+both with the operator. The committed `plugin/plugin.json` is only the
+`0.0.0`/checksum template consumed by release CI, not an installable release
+manifest.
 
 ## Layout
 
@@ -36,7 +49,10 @@ plugin/
                        artifacts, sha256 filled by release CI)
 ```
 
-## Key mappings from the in-proc module (bamboo #480 gap analysis)
+## Key mappings from the in-proc module
+
+These are the seams shipped by
+[Bamboo #480](https://github.com/bigduu/Bamboo-agent/issues/480):
 
 | in-proc dependency | Magpie replacement |
 |---|---|
@@ -55,7 +71,7 @@ plugin/
 
 ```json
 {
-  "bamboo": { "base_url": "http://127.0.0.1:9560", "device_id": "…", "token": "…" },
+  "bamboo": { "base_url": "http://127.0.0.1:9562", "device_id": "…", "token": "…" },
   "platforms": [
     { "type": "telegram", "token": "…", "allow_from": ["…"] },
     { "type": "feishu", "app_id": "…", "app_secret": "…", "domain": "feishu", "allow_from": ["…"] }
@@ -63,9 +79,8 @@ plugin/
 }
 ```
 
-v1 keeps secrets plaintext in the file (0600 perms enforced at load, warn
-otherwise) — bamboo's encrypted round-trip is coupled to bamboo's key store
-and does not extract; revisit post-v1.
+Magpie keeps secrets plaintext in the file. On Unix, group- or world-readable
+permissions produce a startup warning; Magpie does not rewrite the file mode.
 
 ## Invariants carried over from bamboo connect/
 
@@ -80,5 +95,4 @@ and does not extract; revisit post-v1.
 
 - WS resubscribe replays critical events + last budget only — a mid-run
   reconnect misses tokens (terminal event still lands; next edit repaints).
-- Two round trips per message (chat then execute) until/unless bamboo grows
-  a combined /turn endpoint.
+- Each message uses two requests: `/chat`, then `/execute`.
