@@ -5,6 +5,24 @@ drives Bamboo agent sessions from IM platforms (Telegram, Feishu/Lark) exclusive
 Bamboo's public HTTP/WS API — never in-process internals — and ships as a Bamboo **service
 plugin**: bamboo-server installs, spawns, supervises, and restarts it.
 
+## Keep working from your chat app
+
+Send a request from Telegram or Feishu/Lark to a running Bamboo agent and receive
+its responses in the same conversation. Magpie is useful when you want an IM entry
+point for an existing Bamboo setup; it does not replace the agent runtime or its
+model-provider configuration. Restrict access with each platform's `allow_from` list.
+
+You need a reachable Bamboo server, a paired Bamboo device credential, and a bot/app
+credential for your chosen platform. Telegram uses polling and Feishu/Lark uses a
+long-lived connection; this guide does not require publishing a webhook endpoint.
+
+## Source versus releases
+
+The inspected source is six commits ahead of tag `v0.1.1`, including fixes for
+resuming pending questions after reconnects, queued messages, `/stop`, and waiting
+for initial configuration. Do not assume those fixes are in the `v0.1.1` binaries.
+See [audit notes](./docs/readme-audit.md) for exact revisions and verification limits.
+
 Named after 鹊桥 (_què qiáo_, "magpie bridge") — the bridge of magpies that spans the Silver
 River in the Qixi legend, connecting two separated worlds. Magpie spans the same gap between
 a chat platform and a running Bamboo agent.
@@ -36,6 +54,8 @@ artifacts:
   manager owns Magpie, or build the same binary from source:
 
   ```bash
+  git clone https://github.com/bigduu/Magpie.git
+  cd Magpie
   cargo build --release
   ./target/release/magpie --config ./magpie.json --check   # smoke-test auth + connectivity
   ./target/release/magpie --config ./magpie.json            # run
@@ -43,7 +63,8 @@ artifacts:
 
 `--check` calls `GET /api/v1/execute/defaults` against the configured Bamboo instance and
 prints the resolved model, then exits — use it to confirm the device token and base URL are
-correct before wiring up a platform.
+correct before wiring up a platform. It does not validate Telegram/Feishu credentials,
+message delivery, or a complete agent run.
 
 ## Config
 
@@ -79,3 +100,8 @@ freshly-configured platform entry never accidentally opens itself to the whole i
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full schema, the Bamboo API mapping table,
 and the invariants carried over from bamboo's in-process `connect/` module.
+
+For a private local config on Unix, run `chmod 600 magpie.json`. Protect the
+config directory too: Magpie stores its conversation/session map beside the config.
+Plugin builds target macOS, Linux, and Windows; this documentation review did not
+exercise native platform behavior or send messages through real IM accounts.
