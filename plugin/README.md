@@ -11,10 +11,13 @@ Magpie's own `main.rs` resolves its config path in this order: `--config`
 flag > `$BAMBOO_PLUGIN_SERVICE_CONFIG` env var > `./magpie.json`. As a plugin
 service, bamboo-server sets `BAMBOO_PLUGIN_SERVICE_CONFIG` when it spawns the
 process, so `plugin.json`'s `services[0].args` is intentionally empty — the
-manifest does not need to pass `--config` explicitly. Point that env var (or
-place a `magpie.json` beside the installed binary) at a config matching the
-schema in `../ARCHITECTURE.md`'s "Config" section (bamboo endpoint +
-device token, plus the `platforms[]` list).
+manifest does not need to pass `--config` explicitly. Put the service config at
+`<Bamboo data dir>/plugin_service_config/magpie/config.json` (normally
+`~/.bamboo/plugin_service_config/magpie/config.json`). For standalone runs, use
+`--config /path/to/magpie.json`. See [configuration](../README.md#config) for the
+Bamboo endpoint, paired device credential, platform credentials and allowlists.
+The source manifest below is release input; install the published plugin bundle,
+not this directory's placeholder manifest.
 
 ## Checksums are placeholders
 
