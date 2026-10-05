@@ -18,15 +18,14 @@ You need a reachable Bamboo server, a paired Bamboo device credential, and a bot
 credential for your chosen platform. Telegram uses polling and Feishu/Lark uses a
 long-lived connection; this guide does not require publishing a webhook endpoint.
 
-## Source versus releases
+## Releases
 
-The latest release is [`v0.1.1`](https://github.com/bigduu/Magpie/releases/tag/v0.1.1).
-`main` already carries the `0.1.2` version bump and unreleased fixes: replies lost after
-answering a resumed question, resuming pending questions after reconnects or restarts,
-queued messages and `/stop` while a question is pending, and waiting for initial
-configuration instead of exit-restart looping. Do not assume those fixes are in the
-`v0.1.1` binaries; see the [full comparison](https://github.com/bigduu/Magpie/compare/v0.1.1...main)
-and the [audit notes](./docs/readme-audit.md).
+The latest release is [`v0.1.2`](https://github.com/bigduu/Magpie/releases/tag/v0.1.2).
+It includes fixes for replies lost after answering a resumed question, resuming pending
+questions after reconnects or restarts, queued messages and `/stop` while a question is
+pending, and waiting for initial configuration instead of exit-restart looping.
+See the [changelog](https://github.com/bigduu/Magpie/releases/tag/v0.1.2) and
+[audit notes](./docs/readme-audit.md).
 
 Named after 鹊桥 (_què qiáo_, "magpie bridge") — the bridge of magpies that spans the Silver
 River in the Qixi legend, connecting two separated worlds. Magpie spans the same gap between
@@ -39,25 +38,30 @@ depends on, and the layout of `src/`.
 
 ## Install
 
-[Magpie releases](https://github.com/bigduu/Magpie/releases/latest) publish two different
-artifacts:
+**Homebrew** (macOS / Linux x86_64 standalone binary):
 
-- `magpie-plugin-v<version>.tar.gz` is the Bamboo service-plugin bundle. With `bamboo serve`
-  running, install the current release (`v0.1.1`) with:
+```sh
+brew tap bigduu/tap
+brew install bigduu/tap/magpie
+magpie --version
+```
+
+[Magpie releases](https://github.com/bigduu/Magpie/releases/latest) also publish:
+
+- `magpie-plugin-v<version>.tar.gz` — the Bamboo service-plugin bundle. With `bamboo serve`
+  running, install **v0.1.2** with:
 
   ```bash
-  bamboo plugin install https://github.com/bigduu/Magpie/releases/download/v0.1.1/magpie-plugin-v0.1.1.tar.gz
+  bamboo plugin install https://github.com/bigduu/Magpie/releases/download/v0.1.2/magpie-plugin-v0.1.2.tar.gz
   ```
-
-  For a later release, replace both `0.1.1` values with that release's version.
 
   Bamboo verifies the signed release's `.sig` sidecar with the Magpie key in its default
   trust store, so no trust-bypass flags are needed. Bamboo then selects the platform binary
   and owns the service lifecycle. Put `magpie.json` at
   `<Bamboo data dir>/plugin_service_config/magpie/config.json` (normally
   `~/.bamboo/plugin_service_config/magpie/config.json`); Bamboo passes that path to Magpie.
-- `magpie-v<version>-<target>.*` contains a standalone binary. Use it when another process
-  manager owns Magpie, or build the same binary from source:
+- `magpie-v<version>-<target>.*` — standalone binary archives (also what Homebrew installs).
+  Or build from source:
 
   ```bash
   git clone https://github.com/bigduu/Magpie.git

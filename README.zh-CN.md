@@ -16,12 +16,12 @@ Magpie 是 [Bamboo](https://github.com/bigduu/Bamboo-agent) 的独立即时通�
 你需要：一个可访问的 Bamboo 服务、一份已配对的 Bamboo 设备凭据，以及所选平台的机器人/应用凭据。
 Telegram 使用轮询，飞书 / Lark 使用长连接；按本文配置不需要对外暴露 webhook 地址。
 
-## 源码与发布版本
+## 发布版本
 
-最新发布版本是 [`v0.1.1`](https://github.com/bigduu/Magpie/releases/tag/v0.1.1)。`main` 已经
-改为 `0.1.2` 版本号，并包含尚未发布的修复：回答恢复的提问后回复丢失、重连或重启后恢复挂起的提问、
-提问挂起期间的消息排队和 `/stop`，以及尚未配置时等待配置而不是反复退出重启。不要假定 `v0.1.1`
-二进制里已有这些修复；见[完整对比](https://github.com/bigduu/Magpie/compare/v0.1.1...main)和
+最新发布版本是 [`v0.1.2`](https://github.com/bigduu/Magpie/releases/tag/v0.1.2)。
+包含的修复：回答恢复的提问后回复丢失、重连或重启后恢复挂起的提问、提问挂起期间的消息排队和
+`/stop`，以及尚未配置时等待配置而不是反复退出重启。见
+[更新说明](https://github.com/bigduu/Magpie/releases/tag/v0.1.2)和
 [审计记录](./docs/readme-audit.md)。
 
 名字来自鹊桥（_què qiáo_）：七夕传说里横跨银河、连接两个被分隔世界的喜鹊之桥。Magpie 跨越的
@@ -33,22 +33,28 @@ bamboo-server 进程内的 `connect/` 模块拆成独立二进制。完整设计
 
 ## 安装
 
-[Magpie releases](https://github.com/bigduu/Magpie/releases/latest) 发布两种不同的制品：
+**Homebrew**（macOS / Linux x86_64 独立二进制）：
 
-- `magpie-plugin-v<version>.tar.gz` 是 Bamboo 服务插件包。在 `bamboo serve` 运行时，用下面的
-  命令安装当前版本（`v0.1.1`）：
+```sh
+brew tap bigduu/tap
+brew install bigduu/tap/magpie
+magpie --version
+```
+
+[Magpie releases](https://github.com/bigduu/Magpie/releases/latest) 还发布：
+
+- `magpie-plugin-v<version>.tar.gz` — Bamboo 服务插件包。在 `bamboo serve` 运行时，用下面的
+  命令安装 **v0.1.2**：
 
   ```bash
-  bamboo plugin install https://github.com/bigduu/Magpie/releases/download/v0.1.1/magpie-plugin-v0.1.1.tar.gz
+  bamboo plugin install https://github.com/bigduu/Magpie/releases/download/v0.1.2/magpie-plugin-v0.1.2.tar.gz
   ```
-
-  以后的版本把两处 `0.1.1` 都换成对应的版本号即可。
 
   Bamboo 会用默认信任库中的 Magpie 公钥校验签名 release 的 `.sig` 文件，不需要任何跳过校验的
   参数。之后由 Bamboo 选择对应平台的二进制并管理服务的生命周期。把 `magpie.json` 放到
   `<Bamboo 数据目录>/plugin_service_config/magpie/config.json`（通常是
   `~/.bamboo/plugin_service_config/magpie/config.json`），Bamboo 会把这个路径传给 Magpie。
-- `magpie-v<version>-<target>.*` 是独立二进制。如果由其他进程管理器来管理 Magpie，就用它；也可以
+- `magpie-v<version>-<target>.*` — 独立二进制压缩包（Homebrew 安装的也是这一类）。如果由其他进程管理器来管理 Magpie，就用它；也可以
   从源码构建同样的二进制：
 
   ```bash
